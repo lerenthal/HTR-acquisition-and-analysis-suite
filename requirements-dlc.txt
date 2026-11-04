@@ -1,0 +1,32 @@
+# Optional pose-estimation stack, installed by install_dlc.bat into a SEPARATE
+# virtual environment (.venv-dlc).
+#
+# Why separate: DeepLabCut pins numpy, and historically has pinned it against
+# what the rest of this app wants. Keeping it in its own environment means a DLC
+# dependency conflict can never stop HTR Studio from opening and scoring a trial.
+#
+# Why optional at all: the shipped detector needs no trained model and scores
+# F1 = 1.00 on the synthetic benchmarks. A pose model earns its keep when you
+# want keypoints for something else -- grooming, rearing, locomotion -- or when
+# real-mouse footage turns out to defeat blob tracking (very low contrast,
+# bedding, two animals in frame).
+#
+# CPU-only build: this host has no CUDA GPU. Change the index URL below if you
+# move to an NVIDIA machine, where training drops from hours to minutes.
+
+--extra-index-url https://download.pytorch.org/whl/cpu
+
+torch>=2.2,<3
+torchvision>=0.17,<1
+
+# DeepLabCut 3.x uses the PyTorch engine.
+deeplabcut>=3.0,<4
+
+# Needed by DLC's augmentation and GUI paths.
+albumentations>=1.4,<2
+scikit-learn>=1.3,<2
+scikit-image>=0.22,<1
+statsmodels>=0.14,<1
+filterpy>=1.4,<2
+pandas>=2.0,<3
+tables>=3.9

@@ -1,0 +1,24 @@
+# Everything the installer fetches or the app produces. The repository is the
+# source, not the install: a clone plus install.bat must reproduce a working
+# copy, and nothing that changes when the app merely runs belongs in history.
+.venv/
+.venv-dlc/
+tools/ffmpeg/
+tools/uv*
+__pycache__/
+*.py[cod]
+
+# Runtime state: recordings, sidecars, logs, exports, caches.
+data/
+
+# The operator's own settings. default_settings.json is tracked; this is not,
+# so a pull never overwrites the camera and path settings of a working rig.
+config/settings.json
+
+# OS and editor noise
+Thumbs.db
+desktop.ini
+.DS_Store
+.idea/
+.vscode/
+*.swp

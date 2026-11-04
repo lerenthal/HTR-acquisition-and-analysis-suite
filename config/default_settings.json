@@ -1,0 +1,104 @@
+{
+  "schema_version": 2,
+  "camera": {
+    "device_name": "Arducam ezBOX VGA GS Mono",
+    "opencv_index": -1,
+    "opencv_backend": "dshow",
+    "preset": "320x240@200 (240 fps actual) - production",
+    "width": 320,
+    "height": 240,
+    "requested_fps": 200,
+    "pixel_format": "mjpeg",
+    "auto_exposure": false,
+    "exposure": -7,
+    "gain": 0,
+    "brightness": 0,
+    "contrast": 32,
+    "gamma": 100,
+    "apply_uvc_before_record": true,
+    "rtbufsize": "512M",
+    "thread_queue_size": 4096
+  },
+  "recording": {
+    "root": "",
+    "container": "avi",
+    "name_template": "{animal}_{group}_{date}_{time}",
+    "segment_enabled": true,
+    "segment_seconds": 300,
+    "total_seconds": 4200,
+    "baseline_seconds": 600,
+    "min_free_gb": 30.0,
+    "write_sidecar": true,
+    "auto_verify_after_record": true
+  },
+  "analysis": {
+    "polarity": "auto",
+    "threshold_mode": "otsu",
+    "threshold_value": 100,
+    "min_area_frac": 0.004,
+    "max_area_frac": 0.45,
+    "morph_kernel": 5,
+    "angle_source": "headpoint",
+    "max_gap_ms": 60.0,
+    "detector": "angle_bandpass",
+    "band_low_hz": 60.0,
+    "band_high_hz": 110.0,
+    "filter_order": 4,
+    "envelope_smooth_ms": 15.0,
+    "threshold_source": "baseline",
+    "threshold_k": 6.0,
+    "threshold_manual": 0.0,
+    "threshold_low_frac": 0.5,
+    "baseline_window_s": [
+      0.0,
+      0.0
+    ],
+    "merge_gap_ms": 60.0,
+    "min_burst_ms": 45.0,
+    "max_burst_ms": 600.0,
+    "require_freq_hz": [
+      55.0,
+      125.0
+    ],
+    "min_half_cycles": 6,
+    "max_invalid_frac": 0.25,
+    "spec_window_ms": 256.0,
+    "spec_overlap": 0.75,
+    "spec_signal_band": [
+      70.0,
+      110.0
+    ],
+    "spec_noise_band": [
+      8.0,
+      50.0
+    ],
+    "spec_ratio_k": 5.0,
+    "spec_power_k": 6.0,
+    "spec_smooth_steps": 3,
+    "workers": 0,
+    "max_frames": 0,
+    "progress_every": 2000
+  },
+  "review": {
+    "frame_cache": 240,
+    "overlay_tracking": true,
+    "overlay_trace_seconds": 2.0
+  },
+  "report": {
+    "bin_seconds": 60,
+    "t0_relative": true,
+    "export_plots": true,
+    "export_signals": false
+  },
+  "ui": {
+    "theme": "light",
+    "last_tab": 0,
+    "window_geometry": "",
+    "plot_antialias": true
+  },
+  "paths": {
+    "ffmpeg": "",
+    "ffprobe": "",
+    "dlc_python": ""
+  }
+}

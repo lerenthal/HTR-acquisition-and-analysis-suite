@@ -1,0 +1,23 @@
+# HTR Studio core dependencies.
+#
+# Deliberately small: no PyTorch, no DeepLabCut, no TensorFlow. The detector is
+# classical signal processing, so the core install is around 250 MB and takes
+# two or three minutes. install_dlc.bat adds the pose-estimation stack later,
+# into a separate virtual environment, if a trained model is ever needed.
+#
+# Upper bounds are there so a future major release cannot silently change
+# behaviour on a machine that re-runs install.bat mid-study.
+
+numpy>=1.26,<3
+opencv-python>=4.9,<6
+scipy>=1.11,<2
+matplotlib>=3.8,<4
+
+# GUI
+PyQt5>=5.15,<6
+pyqtgraph>=0.13,<1
+
+# Utilities
+Send2Trash>=1.8,<2      # delete to the recycle bin instead of unrecoverably.
+                        # Optional at runtime: without it the app still starts
+                        # and "move to recycle bin" explains why it is disabled.

@@ -1,0 +1,47 @@
+[
+  {
+    "name": "320x240@200 (240 fps actual) - production",
+    "width": 320,
+    "height": 240,
+    "requested_fps": 200,
+    "expected_fps": 240,
+    "pixel_format": "mjpeg",
+    "note": "Validated: 7209 frames / 30.01 s = 240.3 fps, zero drops. Nyquist 120 Hz covers the 78-98 Hz HTR band. Recommended."
+  },
+  {
+    "name": "640x480@120 (~100 fps actual) - high spatial detail",
+    "width": 640,
+    "height": 480,
+    "requested_fps": 120,
+    "expected_fps": 100,
+    "pixel_format": "mjpeg",
+    "note": "MJPEG encoder saturates near 100 fps at VGA. Nyquist 50 Hz is BELOW the HTR band - the 90 Hz oscillation will alias. Use only for pose-model training frames or non-HTR scoring."
+  },
+  {
+    "name": "640x480@100 - VGA baseline",
+    "width": 640,
+    "height": 480,
+    "requested_fps": 100,
+    "expected_fps": 100,
+    "pixel_format": "mjpeg",
+    "note": "Same aliasing caveat as above. 3002 frames / 30 s verified."
+  },
+  {
+    "name": "160x120@400 - maximum temporal fidelity",
+    "width": 160,
+    "height": 120,
+    "requested_fps": 400,
+    "expected_fps": 400,
+    "pixel_format": "mjpeg",
+    "note": "Experimental. Very coarse spatially; blob tracking may fail on a 15-20 cm arena. Probe before trusting."
+  },
+  {
+    "name": "320x240@100 - YUV uncompressed",
+    "width": 320,
+    "height": 240,
+    "requested_fps": 100,
+    "expected_fps": 100,
+    "pixel_format": "yuyv422",
+    "note": "No MJPEG compression artifacts, but limited to 100 fps and ~6x the disk rate. Aliases the HTR band."
+  }
+]
