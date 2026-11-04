@@ -26,6 +26,7 @@ client at a time. Starting a recording stops the preview first, and says so.
 from __future__ import annotations
 
 import logging
+import time
 from pathlib import Path
 
 import numpy as np
@@ -36,6 +37,12 @@ from .. import camera, config, ffmpeg_tools, paths, recorder, theme
 from . import widgets as W
 
 log = logging.getLogger(__name__)
+
+#: Preview refresh bounds. 40 ms is 25 Hz, which is as fast as a human eye
+#: needs for framing and focus; the upper bound keeps the preview visibly
+#: alive even on a machine where a frame is expensive.
+PREVIEW_MIN_INTERVAL_MS = 40
+PREVIEW_MAX_INTERVAL_MS = 250
 
 
 class AcquisitionTab(QtWidgets.QWidget):
@@ -53,13 +60,21 @@ class AcquisitionTab(QtWidgets.QWidget):
         self.indices: list[camera.ProbedIndex] = []
         self.presets = config.load_capture_presets()
         self._last_metrics: camera.FrameMetrics | None = None
-
-        self._build()
-        self._load_from_config()
-
-        self.preview_timer = QtCore.QTimer(self)
-        self.preview_timer.setInterval(40)  # 25 Hz is plenty for a human eye
         self._hist_broken = False
+        self._start_after_preflight = False
+
+        # Runners come before _build: the widget construction binds buttons to
+        # them so that a running job disables its own button.
+        self._hist_broken = False
+        self._start_after_preflight = False
+        self.preflight_job = W.JobRunner("preflight", self)
+        self.preflight_job.finished.connect(self._preflight_done)
+        self.preflight_job.failed.connect(
+            lambda m, tb: self.lbl_rec.set(f"Pre-flight failed: {m}", "bad"))
+        self.devices_job = W.JobRunner("enumerate-devices", self)
+        self.devices_job.finished.connect(self._devices_done)
+        self.devices_job.failed.connect(
+            lambda m, tb: self.lbl_device.set(f"Enumeration failed: {m}", "bad"))
         self.probe_job = W.JobRunner("mode-probe", self)
         self.probe_job.finished.connect(self._probe_done)
         self.probe_job.failed.connect(self._job_failed)
@@ -67,13 +82,19 @@ class AcquisitionTab(QtWidgets.QWidget):
         self.verify_job.finished.connect(
             lambda v: self.lbl_rec.set(v.message, "ok" if v.ok else "warn"))
         self.verify_job.failed.connect(self._job_failed)
+
+        self._build()
+        self._load_from_config()
+
+        self.preview_timer = QtCore.QTimer(self)
+        self.preview_timer.setInterval(PREVIEW_MIN_INTERVAL_MS)
         self.preview_timer.timeout.connect(self._tick_preview)
 
         self.rec_timer = QtCore.QTimer(self)
         self.rec_timer.setInterval(500)
         self.rec_timer.timeout.connect(self._tick_recording)
 
-        QtCore.QTimer.singleShot(300, self.refresh_devices)
+        QtCore.QTimer.singleShot(0, self.refresh_devices)
 
     # ------------------------------------------------------------------
     # Layout
@@ -406,6 +427,7 @@ class AcquisitionTab(QtWidgets.QWidget):
         v.addWidget(self.lbl_rec)
 
         self.btn_preflight.clicked.connect(self._preflight)
+        self.preflight_job._button = self.btn_preflight
         self.btn_start.clicked.connect(self._start_recording)
         self.btn_t0.clicked.connect(self._mark_t0)
         self.btn_stop.clicked.connect(self._stop_recording)
@@ -473,8 +495,15 @@ class AcquisitionTab(QtWidgets.QWidget):
     # Device discovery
     # ------------------------------------------------------------------
     def refresh_devices(self) -> None:
-        self.lbl_device.set("Enumerating cameras…", "info")
+        """Enumerate cameras, off the GUI thread.
 
+        Both halves of this are slow, and the second is punishing: probing
+        OpenCV indices opens up to six DirectShow devices, and on Windows an
+        index with nothing behind it can block for a second or more before it
+        gives up. enumerate_indices' own docstring says to call it from a
+        worker thread; it was being called from the GUI thread, at startup and
+        on every Refresh, which is what made the Acquisition tab feel stuck.
+        """
         if not paths.is_windows():
             self.lbl_device.set(
                 "Camera enumeration uses Windows DirectShow, which is not available "
@@ -483,14 +512,26 @@ class AcquisitionTab(QtWidgets.QWidget):
             self.btn_preview.setEnabled(False)
             self.btn_start.setEnabled(False)
             return
-
-        try:
-            self.devices = ffmpeg_tools.list_dshow_devices(
-                self.ctx.cfg.get("paths.ffmpeg", ""))
-        except ffmpeg_tools.FFmpegMissing as e:
-            self.lbl_device.set(str(e), "bad")
+        if self.preview is not None:
+            self.lbl_device.set(
+                "Stop the preview first - enumerating claims the camera.", "warn")
             return
+        self.lbl_device.set("Enumerating cameras…", "info")
+        ffpath = self.ctx.cfg.get("paths.ffmpeg", "")
+        backend = self.ctx.cfg.get("camera.opencv_backend", "dshow")
 
+        def job(progress=None):
+            devices = ffmpeg_tools.list_dshow_devices(ffpath)
+            if progress:
+                progress(1, 2, "probing preview indices")
+            indices = camera.enumerate_indices(6, backend)
+            return devices, indices
+
+        if not self.devices_job.start(job):
+            self.lbl_device.set("Already enumerating…", "warn")
+
+    def _devices_done(self, result) -> None:
+        self.devices, self.indices = result
         self.cb_device.clear()
         for d in self.devices:
             self.cb_device.addItem(d.name)
@@ -499,8 +540,6 @@ class AcquisitionTab(QtWidgets.QWidget):
         if match:
             self.cb_device.setCurrentText(match.name)
 
-        self.indices = camera.enumerate_indices(
-            6, self.ctx.cfg.get("camera.opencv_backend", "dshow"))
         self.cb_index.clear()
         for p in self.indices:
             self.cb_index.addItem(p.label, p.index)
@@ -757,8 +796,20 @@ class AcquisitionTab(QtWidgets.QWidget):
             self.plot_hist.setTitle("Intensity histogram (unavailable - see log)")
 
     def _tick_preview(self) -> None:
+        """One preview frame: draw it and update the lighting readouts.
+
+        The interval adapts to what the tick actually costs. A repeating timer
+        whose handler takes longer than its interval does not merely run late
+        -- it leaves no gap for anything else, so clicks sit in the queue
+        behind the next frame and the whole window feels stuck. The metrics
+        are the expensive part and they scale with frame area, so a VGA
+        preview on a slower machine can exceed the 40 ms period while a QVGA
+        one never comes close. Rather than guess, measure and back off, and
+        recover when it gets cheap again.
+        """
         if self.preview is None or not self.preview.running:
             return
+        t_start = time.perf_counter()
         gray = self.preview.read()
         if gray is None:
             return
@@ -778,6 +829,24 @@ class AcquisitionTab(QtWidgets.QWidget):
                 lbl.set(text, level)
             else:
                 lbl.set("", "info")
+        self._pace_preview((time.perf_counter() - t_start) * 1000.0)
+
+    #: Never let the preview consume more than this share of the event loop.
+    PREVIEW_DUTY = 0.5
+
+    def _pace_preview(self, cost_ms: float) -> None:
+        """Keep the preview below PREVIEW_DUTY of the event loop's time."""
+        self._tick_cost_ms = (0.8 * getattr(self, "_tick_cost_ms", cost_ms)
+                              + 0.2 * cost_ms)
+        want = int(max(PREVIEW_MIN_INTERVAL_MS,
+                       min(PREVIEW_MAX_INTERVAL_MS,
+                           self._tick_cost_ms / self.PREVIEW_DUTY)))
+        cur = self.preview_timer.interval()
+        # Only move in steps, so the rate does not oscillate frame to frame.
+        if want > cur * 1.3 or want < cur * 0.7:
+            self.preview_timer.setInterval(want)
+            log.debug("preview interval %d -> %d ms (tick costs %.1f ms)",
+                      cur, want, self._tick_cost_ms)
 
     def _snapshot(self) -> None:
         paths.ensure_dirs()
@@ -874,10 +943,25 @@ class AcquisitionTab(QtWidgets.QWidget):
                else ", as one file.")
             + "  Segmenting means an interruption costs only the last segment.")
 
-    def _preflight(self) -> list:
+    def _preflight(self) -> None:
+        """Run the pre-flight checks off the GUI thread.
+
+        They are not cheap and two of them are genuinely slow: the write-path
+        probe writes 6 MB in fsync'd pieces, and the free-space and name checks
+        touch the recordings disk, which may be a network share. Pressing the
+        button should not stop the window, least of all on a rig where that
+        disk is the thing being investigated.
+        """
         spec = self._spec()
-        checks = recorder.preflight(spec, self.ctx.cfg.section("paths"),
-                                    float(self.ctx.cfg.get("recording.min_free_gb", 30)))
+        cfg_paths = self.ctx.cfg.section("paths")
+        min_free = float(self.ctx.cfg.get("recording.min_free_gb", 30))
+        self.lbl_rec.set("Running pre-flight checks…", "info")
+        if not self.preflight_job.start(
+                lambda progress=None: recorder.preflight(spec, cfg_paths,
+                                                         min_free)):
+            self.lbl_rec.set("Pre-flight is already running.", "warn")
+
+    def _preflight_done(self, checks: list) -> None:
         rows = [("ok" if c.ok else ("bad" if c.fatal else "warn"), c.name, c.detail)
                 for c in checks]
         self.checks.set_rows(rows, self.pal)
@@ -889,10 +973,20 @@ class AcquisitionTab(QtWidgets.QWidget):
             self.lbl_rec.set("Warnings only; recording is possible.", "warn")
         else:
             self.lbl_rec.set("All checks passed.", "ok")
-        return checks
+        if self._start_after_preflight:
+            self._start_after_preflight = False
+            self._start_checked(checks)
 
     def _start_recording(self) -> None:
-        checks = self._preflight()
+        """Start a trial, once the checks have run.
+
+        The checks are asynchronous now, so this arms a flag and returns; the
+        recording itself begins in _start_checked when the results arrive.
+        """
+        self._start_after_preflight = True
+        self._preflight()
+
+    def _start_checked(self, checks: list) -> None:
         if [c for c in checks if not c.ok and c.fatal]:
             W.warn_box(self, "Cannot record",
                        "Fix the blocking items in the checklist first.")
@@ -1054,6 +1148,7 @@ class AcquisitionTab(QtWidgets.QWidget):
         W.warn_box(self, "Operation failed", msg)
 
     def shutdown(self) -> None:
+        W.stop_jobs(self)
         self.preview_timer.stop()
         self.rec_timer.stop()
         if self.preview is not None:

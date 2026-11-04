@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -204,6 +205,89 @@ class Entry:
 # --------------------------------------------------------------------------
 # Scanning
 # --------------------------------------------------------------------------
+# --------------------------------------------------------------------------
+# Probe cache
+# --------------------------------------------------------------------------
+# Scanning used to launch one ffprobe process per video, on every rescan, for
+# information that cannot change unless the file does. On Linux that is ~175 ms
+# a file; on Windows each launch also pays CreateProcess and an anti-virus scan
+# of a ~100 MB static ffprobe.exe, so 200-600 ms a file is normal and a
+# twenty-trial library costs four to twelve seconds of subprocess churn to
+# learn nothing new.
+#
+# The cache is keyed on size and modification time, so a file that is edited,
+# re-encoded or replaced is re-probed and anything else is read from disk. It
+# lives in the application's own data folder rather than beside the recordings:
+# a scan must not write files into the operator's video folders.
+_PROBE_CACHE_FILE = paths.CACHE_DIR / "probe_cache.json"
+_PROBE_CACHE_VERSION = 1
+_probe_cache: dict | None = None
+_probe_cache_dirty = False
+_probe_lock = threading.Lock()
+
+
+def _load_probe_cache() -> dict:
+    global _probe_cache
+    if _probe_cache is None:
+        doc = read_json(_PROBE_CACHE_FILE)
+        if doc.get("version") != _PROBE_CACHE_VERSION:
+            doc = {"version": _PROBE_CACHE_VERSION, "entries": {}}
+        _probe_cache = doc
+    return _probe_cache
+
+
+def flush_probe_cache() -> None:
+    """Write the cache if anything changed. Cheap to call when idle."""
+    global _probe_cache_dirty
+    with _probe_lock:
+        if not _probe_cache_dirty or _probe_cache is None:
+            return
+        try:
+            write_json(_PROBE_CACHE_FILE, _probe_cache)
+            _probe_cache_dirty = False
+        except OSError as e:  # pragma: no cover - a cache must never be fatal
+            log.warning("could not write the probe cache: %s", e)
+
+
+def clear_probe_cache() -> None:
+    global _probe_cache, _probe_cache_dirty
+    with _probe_lock:
+        _probe_cache = {"version": _PROBE_CACHE_VERSION, "entries": {}}
+        _probe_cache_dirty = True
+
+
+_PROBE_FIELDS = ("width", "height", "codec", "pix_fmt", "container_fps",
+                 "frames", "duration_s", "exact")
+
+
+def _cached_probe(video: Path, size: int, mtime: float):
+    """A previous probe of this exact file, or None."""
+    with _probe_lock:
+        rec = _load_probe_cache()["entries"].get(str(video))
+    if not rec:
+        return None
+    if rec.get("size") != size or abs(rec.get("mtime", -1) - mtime) > 1e-6:
+        return None
+    info = ffmpeg_tools.VideoInfo(path=video, size_bytes=size)
+    for f in _PROBE_FIELDS:
+        if f in rec:
+            setattr(info, f, rec[f])
+    return info
+
+
+def _store_probe(video: Path, size: int, mtime: float,
+                 info: "ffmpeg_tools.VideoInfo") -> None:
+    global _probe_cache_dirty
+    if info.error or not info.width:
+        return
+    rec = {"size": size, "mtime": mtime}
+    for f in _PROBE_FIELDS:
+        rec[f] = getattr(info, f, None)
+    with _probe_lock:
+        _load_probe_cache()["entries"][str(video)] = rec
+        _probe_cache_dirty = True
+
+
 def _entry_from_video(video: Path, cfg_paths: dict, deep: bool) -> Entry:
     e = Entry(path=video)
     try:
@@ -214,9 +298,13 @@ def _entry_from_video(video: Path, cfg_paths: dict, deep: bool) -> Entry:
         return e
     e.sidecar = read_json(sidecar_for(video))
     e.result = read_json(result_for(video))
-    info = ffmpeg_tools.probe_video(video, cfg_paths.get("ffprobe", ""),
-                                    count_frames=deep,
-                                    timeout=900 if deep else 60)
+    info = None if deep else _cached_probe(video, e.size_bytes, e.mtime)
+    if info is None:
+        info = ffmpeg_tools.probe_video(video, cfg_paths.get("ffprobe", ""),
+                                        count_frames=deep,
+                                        timeout=900 if deep else 60)
+        if not deep:
+            _store_probe(video, e.size_bytes, e.mtime, info)
     if info.error:
         e.error = info.error
     e.width, e.height, e.codec = info.width, info.height, info.codec
@@ -317,6 +405,7 @@ def scan(root: Path | str, deep: bool = False, cfg_paths: dict | None = None,
                 log.warning("library scan stopped at %d entries", max_entries)
                 return entries
     entries.sort(key=lambda x: x.mtime, reverse=True)
+    flush_probe_cache()
     return entries
 
 

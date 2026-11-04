@@ -1036,4 +1036,5 @@ class AnalysisTab(QtWidgets.QWidget):
                          "shows in the Library and can be curated in Review.", "ok")
 
     def shutdown(self) -> None:
+        W.stop_jobs(self)
         self.run_job.wait(5000)

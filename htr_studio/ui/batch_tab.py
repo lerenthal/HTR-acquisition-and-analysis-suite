@@ -415,6 +415,7 @@ class BatchTab(QtWidgets.QWidget):
                " (no rate CSVs in the output folder, so no group figure)"), "ok")
 
     def shutdown(self) -> None:
+        W.stop_jobs(self)
         self.scan_job.wait(3000)
         self.run_job.wait(8000)
         if self.worker is not None and self.worker.isRunning():

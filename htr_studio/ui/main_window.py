@@ -303,7 +303,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 return
         self._save_settings()
         for tab in (self.tab_acq, self.tab_lib, self.tab_review,
-                    self.tab_analysis, self.tab_batch):
+                    self.tab_analysis, self.tab_batch, self.tab_settings):
             try:
                 tab.shutdown()
             except Exception:  # pragma: no cover

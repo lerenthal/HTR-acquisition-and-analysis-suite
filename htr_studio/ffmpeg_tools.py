@@ -86,6 +86,10 @@ def ffprobe_path(configured: str = "") -> Path:
     return p
 
 
+#: tool -> ((path, size, mtime), version string). See tool_versions.
+_VERSION_CACHE: dict[str, tuple] = {}
+
+
 def tool_versions(cfg_paths: dict | None = None) -> dict[str, str]:
     cfg_paths = cfg_paths or {}
     out: dict[str, str] = {}
@@ -94,11 +98,26 @@ def tool_versions(cfg_paths: dict | None = None) -> dict[str, str]:
         if p is None:
             out[tool] = "NOT FOUND"
             continue
+        # Memoised on (path, size, mtime). A tool's version string cannot
+        # change unless the binary does, and each lookup is a process launch --
+        # on Windows, of a ~100 MB static executable that anti-virus inspects
+        # every time. Settings, the self-test and several status lines all ask
+        # for this, and it was re-launching both tools on every call.
+        try:
+            st = p.stat()
+            stamp = (str(p), st.st_size, st.st_mtime)
+        except OSError:
+            stamp = (str(p), -1, -1.0)
+        hit = _VERSION_CACHE.get(tool)
+        if hit is not None and hit[0] == stamp:
+            out[tool] = hit[1]
+            continue
         try:
             r = subprocess.run([str(p), "-version"], capture_output=True, text=True,
                                timeout=20, **_NO_WINDOW)
             first = (r.stdout or r.stderr).splitlines()[0] if (r.stdout or r.stderr) else "?"
             out[tool] = f"{first}  [{p}]"
+            _VERSION_CACHE[tool] = (stamp, out[tool])
         except (OSError, subprocess.SubprocessError) as e:
             out[tool] = f"error: {e}"
     return out

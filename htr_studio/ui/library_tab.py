@@ -49,7 +49,7 @@ class LibraryTab(QtWidgets.QWidget):
         self._build()
         self.scan_job._button = self.btn_rescan
         self.verify_job._button = self.btn_verify
-        QtCore.QTimer.singleShot(400, self.rescan)
+        QtCore.QTimer.singleShot(0, self.rescan)
 
     # ------------------------------------------------------------------
     def _build(self) -> None:
@@ -487,5 +487,6 @@ class LibraryTab(QtWidgets.QWidget):
         return None
 
     def shutdown(self) -> None:
+        W.stop_jobs(self)
         self.scan_job.wait(3000)
         self.verify_job.wait(3000)

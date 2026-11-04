@@ -626,6 +626,7 @@ class ReviewTab(QtWidgets.QWidget):
         self.lbl_status.set(f"Curated report written to {rep.combined_csv}", "ok")
 
     def shutdown(self) -> None:
+        W.stop_jobs(self)
         self.play_timer.stop()
         if self.reader is not None:
             self.reader.close()

@@ -28,7 +28,12 @@ class SettingsTab(QtWidgets.QWidget):
     def __init__(self, ctx, parent=None):
         super().__init__(parent)
         self.ctx = ctx
+        self.tools_job = W.JobRunner("tool-check", self)
+        self.tools_job.finished.connect(self._tools_done)
+        self.env_job = W.JobRunner("environment", self)
         self._build()
+        # txt_env exists only after _build.
+        self.env_job.finished.connect(self.txt_env.setPlainText)
         self._load()
 
     def _build(self) -> None:
@@ -264,9 +269,16 @@ class SettingsTab(QtWidgets.QWidget):
             W.warn_box(self, "Could not open", f"{target}\n\n{e}")
 
     def _check_tools(self) -> None:
-        versions = ffmpeg_tools.tool_versions({
-            "ffmpeg": self.in_ffmpeg.text().strip(),
-            "ffprobe": self.in_ffprobe.text().strip()})
+        """Ask the tools their versions. Off-thread: each is a process launch,
+        and on Windows a ~100 MB static binary that anti-virus inspects."""
+        cfg = {"ffmpeg": self.in_ffmpeg.text().strip(),
+               "ffprobe": self.in_ffprobe.text().strip()}
+        self.lbl_tools.setPlainText("Checking…")
+        if not self.tools_job.start(
+                lambda progress=None: ffmpeg_tools.tool_versions(cfg)):
+            self.lbl_tools.setPlainText("Already checking…")
+
+    def _tools_done(self, versions: dict) -> None:
         lines = [f"{k}: {v}" for k, v in versions.items()]
         missing = [k for k, v in versions.items() if "NOT FOUND" in v]
         if missing:
@@ -276,6 +288,12 @@ class SettingsTab(QtWidgets.QWidget):
         self.lbl_tools.setPlainText("\n".join(lines))
 
     def _show_env(self) -> None:
+        """Collect the environment report off-thread (it probes the tools)."""
+        self.txt_env.setPlainText("Collecting…")
+        if not self.env_job.start(lambda progress=None: self._env_text()):
+            self.txt_env.setPlainText("Already collecting…")
+
+    def _env_text(self) -> str:
         import numpy
         import cv2
         import scipy
@@ -312,7 +330,7 @@ class SettingsTab(QtWidgets.QWidget):
         ]
         for k, v in ffmpeg_tools.tool_versions(self.ctx.cfg.section("paths")).items():
             lines.append(f"{k}: {v}")
-        self.txt_env.setPlainText("\n".join(lines))
+        return "\n".join(lines)
 
     def _reset(self) -> None:
         if not W.ask_yes_no(
@@ -330,3 +348,7 @@ class SettingsTab(QtWidgets.QWidget):
         self._load()
         self.lbl_saved.set("Settings reset. Restart the app to reload every panel.",
                            "ok")
+
+    def shutdown(self) -> None:
+        """Stop background jobs. The window calls this before closing."""
+        W.stop_jobs(self)

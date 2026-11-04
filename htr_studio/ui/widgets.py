@@ -586,6 +586,29 @@ def form_row(layout: QtWidgets.QFormLayout, label: str,
     return widget
 
 
+def stop_jobs(owner: object, msec: int = 5000) -> int:
+    """Stop every JobRunner attribute of ``owner``. Returns how many it found.
+
+    Shutdown used to name each runner by hand, which is a list that goes stale
+    the moment someone adds one: the Settings tab was not even in the window's
+    shutdown loop, so its jobs were still running when Qt tore the widget down
+    -- the QThread abort, reintroduced by omission rather than by design.
+    Sweeping the attributes cannot go stale.
+    """
+    found = 0
+    for name in dir(owner):
+        if not name.endswith("_job"):
+            continue
+        try:
+            runner = getattr(owner, name)
+        except Exception:  # pragma: no cover - properties that raise
+            continue
+        if isinstance(runner, JobRunner):
+            runner.wait(msec)
+            found += 1
+    return found
+
+
 class AsyncFrameReader(QtCore.QObject):
     """Decodes frames on a worker thread and coalesces seek requests.
 
