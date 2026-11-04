@@ -12,6 +12,7 @@ Two conventions worth stating because the rest of the UI depends on them:
 from __future__ import annotations
 
 import logging
+import threading
 import traceback
 from collections import OrderedDict
 from pathlib import Path
@@ -297,6 +298,161 @@ class Worker(QtCore.QThread):
         self.finishedOk.emit(result)
 
 
+class JobRunner(QtCore.QObject):
+    """Owns one background job at a time, for one button.
+
+    Two problems, one object.
+
+    **The crash.** The pattern this replaces was ``self.worker = Worker(...)``
+    at nine call sites, with nothing stopping a second start. Pressing the
+    button twice rebinds the attribute, and if the first ``QThread`` is still
+    running when Python collects it, Qt aborts the whole process with "QThread:
+    Destroyed while thread is still running" -- the window vanishes, mid-trial,
+    with no warning. A runner refuses to start while it is busy, so the race
+    cannot be reached from the UI at all.
+
+    **The freeze.** The modules that had no worker used
+    ``QApplication.processEvents()`` instead, which repaints without yielding:
+    the window looks alive while input queues up behind an operation measured at
+    up to 23.8 seconds. Making a job easy to run off-thread -- button handling,
+    progress, cancellation and re-enabling all included -- is what removes the
+    temptation.
+
+    The runner keeps a reference to the thread for its whole life, so nothing is
+    collected while running, and it always re-enables its button, including on
+    failure and cancellation.
+    """
+
+    started = QtCore.pyqtSignal()
+    progressed = QtCore.pyqtSignal(int, int, str)
+    finished = QtCore.pyqtSignal(object)
+    failed = QtCore.pyqtSignal(str, str)
+    cancelled = QtCore.pyqtSignal()
+    busyChanged = QtCore.pyqtSignal(bool)
+
+    def __init__(self, name: str = "job", parent=None,
+                 button: QtWidgets.QAbstractButton | None = None,
+                 cancel_button: QtWidgets.QAbstractButton | None = None,
+                 progress: QtWidgets.QProgressBar | None = None):
+        super().__init__(parent)
+        self.name = name
+        self._worker: Worker | None = None
+        self._button = button
+        self._cancel_button = cancel_button
+        self._progress = progress
+        if cancel_button is not None:
+            cancel_button.setEnabled(False)
+            cancel_button.clicked.connect(self.cancel)
+
+    # ------------------------------------------------------------------
+    @property
+    def busy(self) -> bool:
+        return self._worker is not None and self._worker.isRunning()
+
+    def start(self, fn: Callable[..., Any], *args, **kwargs) -> bool:
+        """Run ``fn`` off the main thread. False if a job is already running."""
+        if self.busy:
+            log.debug("%s: ignored a second start while busy", self.name)
+            return False
+        w = Worker(fn, *args, parent=self, **kwargs)
+        self._worker = w
+        w.progressed.connect(self._on_progress)
+        w.finishedOk.connect(self._on_done)
+        w.failed.connect(self._on_failed)
+        self._set_busy(True)
+        self.started.emit()
+        w.start()
+        return True
+
+    def cancel(self) -> None:
+        if self._worker is not None and self._worker.isRunning():
+            self._worker.cancel()
+
+    #: Workers that outlived their owner. See :meth:`wait`.
+    _orphans: set = set()
+
+    def wait(self, msec: int = 5000) -> None:
+        """Stop and join. Called from shutdown paths, so it must not raise.
+
+        A job that does not stop within the budget is **detached** rather than
+        left to be destroyed. Closing a dialog deletes its children, and
+        deleting a running ``QThread`` aborts the process -- which is the crash
+        this class exists to prevent, so it must not be reintroduced by the
+        cleanup path. A long scan cancelled at the last moment can easily still
+        be inside a decode when the budget expires; reparenting it to nothing
+        and holding a reference until it finishes lets it end quietly instead.
+        """
+        w = self._worker
+        self._worker = None
+        if w is None:
+            return
+        try:
+            if not w.isRunning():
+                return
+            w.cancel()
+            if w.wait(msec):
+                return
+            log.warning("%s did not stop within %d ms; detaching it so closing "
+                        "the window cannot destroy a running thread",
+                        self.name, msec)
+            w.setParent(None)
+            JobRunner._orphans.add(w)
+            w.finished.connect(lambda w=w: JobRunner._orphans.discard(w))
+        except RuntimeError:  # pragma: no cover - already destroyed by Qt
+            pass
+
+    @staticmethod
+    def join_all(msec: int = 8000) -> None:
+        """Wait for detached workers. Called once on application exit."""
+        for w in list(JobRunner._orphans):
+            try:
+                if w.isRunning():
+                    w.cancel()
+                    w.wait(msec)
+            except RuntimeError:  # pragma: no cover
+                pass
+            JobRunner._orphans.discard(w)
+
+    # ------------------------------------------------------------------
+    def _set_busy(self, busy: bool) -> None:
+        if self._button is not None:
+            self._button.setEnabled(not busy)
+        if self._cancel_button is not None:
+            self._cancel_button.setEnabled(busy)
+        if self._progress is not None:
+            self._progress.setVisible(True)
+            if busy:
+                # Indeterminate until the job reports a total it knows.
+                self._progress.setRange(0, 0)
+            else:
+                self._progress.setRange(0, 100)
+                self._progress.setValue(0)
+        self.busyChanged.emit(busy)
+
+    def _on_progress(self, done: int, total: int, msg: str) -> None:
+        if self._progress is not None and total > 0:
+            self._progress.setRange(0, total)
+            self._progress.setValue(min(done, total))
+        self.progressed.emit(done, total, msg)
+
+    def _finish(self) -> None:
+        self._set_busy(False)
+        self._worker = None
+
+    def _on_done(self, result) -> None:
+        was_cancelled = self._worker is not None and self._worker.cancelled
+        self._finish()
+        if was_cancelled:
+            self.cancelled.emit()
+        else:
+            self.finished.emit(result)
+
+    def _on_failed(self, msg: str, tb: str) -> None:
+        log.error("%s failed: %s\n%s", self.name, msg, tb)
+        self._finish()
+        self.failed.emit(msg, tb)
+
+
 class FrameReader:
     """On-demand frame access with a small LRU cache.
 
@@ -381,6 +537,16 @@ class FrameReader:
                 if self.get(i) is None:
                     break
 
+    # -- thread-safety ------------------------------------------------
+    # AsyncFrameReader drives one of these from a single decoder thread while
+    # the GUI thread reads the cache. Only the cache is shared, and dict
+    # operations are atomic under the GIL, so no lock is needed here -- but
+    # nothing else may touch the VideoCapture concurrently.
+
+    def peek(self, index: int) -> np.ndarray | None:
+        """Return a cached frame, or None. Never decodes, never blocks."""
+        return self._cache.get(int(index))
+
     def __enter__(self) -> "FrameReader":
         return self
 
@@ -418,6 +584,133 @@ def form_row(layout: QtWidgets.QFormLayout, label: str,
         return box
     layout.addRow(label, widget)
     return widget
+
+
+class AsyncFrameReader(QtCore.QObject):
+    """Decodes frames on a worker thread and coalesces seek requests.
+
+    Scrubbing was the worst everyday cost in the application: each decode was
+    measured at 127-197 ms on the GUI thread, and a slider drag emits one
+    request per pixel of travel. Those requests queued, so a drag across a
+    70-minute trial committed the interface to minutes of work with no way to
+    interrupt it -- and because they were served in order, the frames arrived
+    long after the mouse had moved on.
+
+    Two changes fix it. Decoding moves to its own thread, and the queue has
+    room for exactly one pending request: a newer one replaces the one waiting,
+    because a frame the user has already scrolled past is worth nothing. The
+    cost of a drag is then bounded by how fast frames decode, not by how many
+    pixels the mouse travelled, and the view always converges on where the
+    slider actually stopped.
+
+    ``frameReady(index, frame)`` arrives on the GUI thread. A request whose
+    frame is already cached is answered synchronously and returns True, so the
+    common case -- stepping one frame -- stays immediate.
+    """
+
+    frameReady = QtCore.pyqtSignal(int, object)
+    failed = QtCore.pyqtSignal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._reader: FrameReader | None = None
+        self._lock = threading.Lock()
+        self._wanted: int | None = None
+        self._new_request = threading.Event()
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._prefetch = 0
+
+    # ------------------------------------------------------------------
+    def open(self, path: Path | str, cache: int = 240, prefetch: int = 8) -> bool:
+        self.close()
+        reader = FrameReader(path, cache=cache)
+        if reader.cap is None:
+            self.failed.emit(reader.error or f"could not open {Path(path).name}")
+            return False
+        self._reader = reader
+        self._prefetch = max(0, int(prefetch))
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run, daemon=True,
+                                        name="frame-decoder")
+        self._thread.start()
+        return True
+
+    def close(self) -> None:
+        self._stop.set()
+        self._new_request.set()
+        t = self._thread
+        if t is not None and t.is_alive():
+            t.join(timeout=3.0)
+        self._thread = None
+        if self._reader is not None:
+            self._reader.close()
+            self._reader = None
+
+    @property
+    def n_frames(self) -> int:
+        return self._reader.n_frames if self._reader else 0
+
+    @property
+    def fps(self) -> float:
+        return self._reader.fps if self._reader else 0.0
+
+    @property
+    def width(self) -> int:
+        return self._reader.width if self._reader else 0
+
+    @property
+    def height(self) -> int:
+        return self._reader.height if self._reader else 0
+
+    # ------------------------------------------------------------------
+    def request(self, index: int) -> bool:
+        """Ask for a frame. True if it was already cached and emitted now."""
+        if self._reader is None:
+            return False
+        index = max(0, int(index))
+        cached = self._reader.peek(index)
+        if cached is not None:
+            self.frameReady.emit(index, cached)
+            return True
+        with self._lock:
+            # One slot: a newer request supersedes whatever was waiting.
+            self._wanted = index
+        self._new_request.set()
+        return False
+
+    def _run(self) -> None:  # pragma: no cover - thread body
+        while not self._stop.is_set():
+            self._new_request.wait(0.2)
+            self._new_request.clear()
+            while not self._stop.is_set():
+                with self._lock:
+                    idx = self._wanted
+                    self._wanted = None
+                if idx is None:
+                    break
+                reader = self._reader
+                if reader is None:
+                    break
+                try:
+                    frame = reader.get(idx)
+                except Exception as e:
+                    log.exception("frame decode failed")
+                    self.failed.emit(str(e))
+                    break
+                if frame is None:
+                    continue
+                with self._lock:
+                    superseded = self._wanted is not None
+                if not superseded:
+                    # Only paint the frame the user is still waiting for.
+                    self.frameReady.emit(idx, frame)
+                    for j in range(idx + 1, idx + 1 + self._prefetch):
+                        with self._lock:
+                            if self._wanted is not None or self._stop.is_set():
+                                break
+                        if reader.peek(j) is None and reader.get(j) is None:
+                            break
 
 
 def form_wrap(layout: QtWidgets.QLayout) -> QtWidgets.QWidget:

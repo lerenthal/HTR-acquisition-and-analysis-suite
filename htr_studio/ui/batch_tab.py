@@ -36,6 +36,14 @@ class BatchTab(QtWidgets.QWidget):
         self.queue: list[library.Entry] = []
         self.results: dict[str, dict] = {}
         self.worker: W.Worker | None = None
+        self.run_job = W.JobRunner("batch", self)
+        self.run_job.progressed.connect(self._on_progress)
+        self.run_job.finished.connect(self._on_done)
+        self.run_job.failed.connect(self._on_failed)
+        self.scan_job = W.JobRunner("batch-scan", self)
+        self.scan_job.finished.connect(self.add_entries)
+        self.scan_job.failed.connect(
+            lambda m, tb: self.lbl_status.set(f"Scan failed: {m}", "bad"))
         self._build()
 
     # ------------------------------------------------------------------
@@ -141,9 +149,11 @@ class BatchTab(QtWidgets.QWidget):
         if not d:
             return
         self.lbl_status.set(f"Scanning {d}…", "info")
-        QtWidgets.QApplication.processEvents()
-        entries = library.scan(d, deep=False, cfg_paths=self.ctx.cfg.section("paths"))
-        self.add_entries(entries)
+        paths_cfg = self.ctx.cfg.section("paths")
+        if not self.scan_job.start(
+                lambda progress=None: library.scan(d, deep=False,
+                                                   cfg_paths=paths_cfg)):
+            self.lbl_status.set("A folder scan is already running.", "warn")
 
     def _remove(self) -> None:
         rows = sorted((i.row() for i in
@@ -279,11 +289,9 @@ class BatchTab(QtWidgets.QWidget):
                         progress(i + 1, len(items), f"FAIL|{key}|{e}")
             return rows, rate_csvs, out_dir, bin_s, theme_name
 
-        self.worker = W.Worker(job, parent=self)
-        self.worker.progressed.connect(self._on_progress)
-        self.worker.finishedOk.connect(self._on_done)
-        self.worker.failed.connect(self._on_failed)
-        self.worker.start()
+        if not self.run_job.start(job):
+            self.lbl_status.set("A batch is already running.", "warn")
+            return
         self.statusMessage.emit(f"Batch started: {len(items)} trial(s)")
 
     def _on_progress(self, done: int, total: int, msg: str) -> None:
@@ -407,6 +415,8 @@ class BatchTab(QtWidgets.QWidget):
                " (no rate CSVs in the output folder, so no group figure)"), "ok")
 
     def shutdown(self) -> None:
+        self.scan_job.wait(3000)
+        self.run_job.wait(8000)
         if self.worker is not None and self.worker.isRunning():
             self.worker.cancel()
             self.worker.wait(8000)

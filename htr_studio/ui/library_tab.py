@@ -41,7 +41,14 @@ class LibraryTab(QtWidgets.QWidget):
         self.pal = theme.palette(ctx.cfg.get("ui.theme", "light"))
         self.entries: list[library.Entry] = []
         self.worker: W.Worker | None = None
+        self.scan_job = W.JobRunner("library-scan", self)
+        self.scan_job.finished.connect(self._scan_done)
+        self.scan_job.failed.connect(self._job_failed)
+        self.verify_job = W.JobRunner("library-verify", self)
+        self.verify_job.failed.connect(self._job_failed)
         self._build()
+        self.scan_job._button = self.btn_rescan
+        self.verify_job._button = self.btn_verify
         QtCore.QTimer.singleShot(400, self.rescan)
 
     # ------------------------------------------------------------------
@@ -200,10 +207,9 @@ class LibraryTab(QtWidgets.QWidget):
         def job(progress=None):
             return library.scan(root, deep=False, cfg_paths=cfg_paths)
 
-        self.worker = W.Worker(job, parent=self)
-        self.worker.finishedOk.connect(self._scan_done)
-        self.worker.failed.connect(self._job_failed)
-        self.worker.start()
+        if not self.scan_job.start(job):
+            self.lbl_summary.set("A scan is already running.", "warn")
+            self.btn_rescan.setEnabled(True)
 
     def _scan_done(self, entries: list) -> None:
         self.btn_rescan.setEnabled(True)
@@ -417,16 +423,17 @@ class LibraryTab(QtWidgets.QWidget):
         def job(progress=None):
             return recorder.verify_recording(target, expected, ffprobe)
 
-        self.worker = W.Worker(job, parent=self)
-
         def done(v):
-            self.btn_verify.setEnabled(True)
             self.lbl_detail.set(v.message, "ok" if v.ok else "warn")
             self.rescan()
 
-        self.worker.finishedOk.connect(done)
-        self.worker.failed.connect(self._job_failed)
-        self.worker.start()
+        try:
+            self.verify_job.finished.disconnect()
+        except TypeError:
+            pass
+        self.verify_job.finished.connect(done)
+        if not self.verify_job.start(job):
+            self.lbl_detail.set("A verification is already running.", "warn")
 
     def _reveal(self) -> None:
         e = self._current()
@@ -480,6 +487,5 @@ class LibraryTab(QtWidgets.QWidget):
         return None
 
     def shutdown(self) -> None:
-        if self.worker is not None and self.worker.isRunning():
-            self.worker.cancel()
-            self.worker.wait(3000)
+        self.scan_job.wait(3000)
+        self.verify_job.wait(3000)

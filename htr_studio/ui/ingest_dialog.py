@@ -44,6 +44,28 @@ from . import widgets as W
 log = logging.getLogger(__name__)
 
 
+def _build_arena(video: str, progress=None):
+    """Background model and arena bounding box. Runs on a worker thread.
+
+    Returns (background, (x, y, w, h) or None, note). Free of Qt so it can be
+    called off the GUI thread and tested without a window.
+    """
+    frames, _n = analysis._sample_frames(video, 40)
+    if not frames:
+        return None, None, "No frames could be decoded from this file."
+    if progress is not None:
+        progress(1, 2, "building the background model")
+    bg = analysis.build_background(frames)
+    mask, note = analysis.auto_roi_from_background(bg)
+    if mask is None:
+        return bg, None, note
+    x, y, w, h = cv2.boundingRect(mask)
+    # Several encoders refuse an odd width or height.
+    w -= w % 2
+    h -= h % 2
+    return bg, (x, y, w, h), note
+
+
 class IngestDialog(QtWidgets.QDialog):
     """Inspection, arena crop, measured size options, and the conversion."""
 
@@ -60,7 +82,28 @@ class IngestDialog(QtWidgets.QDialog):
         self.estimates: list[ingest.SizeEstimate] = []
         self.worker: W.Worker | None = None
         self._bg: np.ndarray | None = None
+        self.inspect_job = W.JobRunner("inspect", self)
+        self.inspect_job.finished.connect(self._inspect_done)
+        self.inspect_job.failed.connect(self._failed)
+        self.measure_job = W.JobRunner("measure", self)
+        self.measure_job.finished.connect(self._measure_done)
+        self.measure_job.failed.connect(self._failed)
+        self.convert_job = W.JobRunner("convert", self)
+        self.convert_job.progressed.connect(self._on_progress)
+        self.convert_job.finished.connect(self._convert_done)
+        self.convert_job.failed.connect(self._failed)
+        self.arena_job = W.JobRunner("find-arena", self)
+        self.arena_job.finished.connect(self._arena_done)
+        self.arena_job.failed.connect(
+            lambda m, tb: self.lbl_arena.set(f"Could not sample the file: {m}",
+                                             "bad"))
         self._build()
+        self.arena_job._button = self.btn_find_arena
+        self.inspect_job._button = self.btn_count
+        self.measure_job._button = self.btn_measure
+        self.convert_job._button = self.btn_convert
+        self.convert_job._cancel_button = self.btn_cancel
+        self.convert_job._progress = self.progress
         QtCore.QTimer.singleShot(0, lambda: self._inspect(count_frames=False))
 
     # ------------------------------------------------------------------
@@ -316,17 +359,14 @@ class IngestDialog(QtWidgets.QDialog):
             "Counting frames - this decodes the whole file…" if count_frames
             else "Reading the header…", "info")
         self.btn_count.setEnabled(False)
-        QtWidgets.QApplication.processEvents()
 
         def job(progress=None):
             return ingest.inspect_file(
                 self.video, self.cfg.get("paths.ffprobe", ""),
                 count_frames=count_frames)
 
-        self.worker = W.Worker(job, parent=self)
-        self.worker.finishedOk.connect(self._inspect_done)
-        self.worker.failed.connect(self._failed)
-        self.worker.start()
+        if not self.inspect_job.start(job):
+            self.lbl_status.set("Already reading this file…", "warn")
 
     def _inspect_done(self, rep) -> None:
         self.report = rep
@@ -364,38 +404,36 @@ class IngestDialog(QtWidgets.QDialog):
     # Arena
     # ------------------------------------------------------------------
     def _find_arena(self) -> None:
+        """Build the background model and take the arena's bounding box.
+
+        Off the GUI thread: it samples 40 frames scattered through the file and
+        was measured at 4.5 s, growing with recording length.
+        """
         self.lbl_arena.set("Building the background model…", "info")
-        QtWidgets.QApplication.processEvents()
-        try:
-            frames, _n = analysis._sample_frames(self.video, 40)
-        except Exception as e:
-            log.exception("sampling failed")
-            self.lbl_arena.set(f"Could not sample the file: {e}", "bad")
+        if not self.arena_job.start(_build_arena, str(self.video)):
+            self.lbl_arena.set("Already looking for the arena…", "warn")
+
+    def _arena_done(self, res) -> None:
+        bg, box, note = res
+        self._bg = bg
+        if bg is None:
+            self.lbl_arena.set(note, "bad")
             return
-        if not frames:
-            self.lbl_arena.set("No frames could be decoded from this file.", "bad")
+        if box is None:
+            self.lbl_arena.set(note + "  Set the crop by hand, or leave it off.",
+                               "warn")
+            self.view.show_frame(bg, {}, "background model")
             return
-        self._bg = analysis.build_background(frames)
-        mask, note = analysis.auto_roi_from_background(self._bg)
-        if mask is None:
-            self.lbl_arena.set(
-                note + "  Set the crop by hand, or leave it off.", "warn")
-            self.view.show_frame(self._bg, {}, "background model")
-            return
-        xs = cv2.boundingRect(mask)
-        x, y, w, h = xs
-        # Even dimensions: several encoders refuse an odd width or height.
-        w -= w % 2
-        h -= h % 2
-        for s, val in zip(self.sp_crop, (x, y, w, h)):
-            s.setValue(int(val))
+        x, y, w, h = box
+        for sp, val in zip(self.sp_crop, (x, y, w, h)):
+            sp.setValue(int(val))
         self.chk_crop.setChecked(True)
-        kept = (w * h) / float(self._bg.shape[0] * self._bg.shape[1])
+        kept = (w * h) / float(bg.shape[0] * bg.shape[1])
         self.lbl_arena.set(
             f"Arena found at {w}x{h} starting ({x},{y}): {kept:.0%} of the "
             f"frame, so cropping removes {1 - kept:.0%} of the pixels at no "
             "cost to the measurement.", "ok")
-        vis = cv2.cvtColor(self._bg, cv2.COLOR_GRAY2BGR)
+        vis = cv2.cvtColor(bg, cv2.COLOR_GRAY2BGR)
         cv2.rectangle(vis, (x, y), (x + w, y + h),
                       W.FrameView._hex_to_bgr(self.pal.s2), 1)
         self.view.show_frame(vis, {}, f"arena {w}x{h}")
@@ -425,10 +463,8 @@ class IngestDialog(QtWidgets.QDialog):
                 ffprobe=self.cfg.get("paths.ffprobe", ""),
                 progress=(lambda m: progress and progress(0, 0, m)))
 
-        self.worker = W.Worker(job, parent=self)
-        self.worker.finishedOk.connect(self._measure_done)
-        self.worker.failed.connect(self._failed)
-        self.worker.start()
+        if not self.measure_job.start(job):
+            self.lbl_status.set("A measurement is already running.", "warn")
 
     def _measure_done(self, ests) -> None:
         self.btn_measure.setEnabled(True)
@@ -530,11 +566,8 @@ class IngestDialog(QtWidgets.QDialog):
                 progress=(lambda d, t, m: bool(progress(d, t, m))
                           if progress else True))
 
-        self.worker = W.Worker(job, parent=self)
-        self.worker.progressed.connect(self._on_progress)
-        self.worker.finishedOk.connect(self._convert_done)
-        self.worker.failed.connect(self._failed)
-        self.worker.start()
+        if not self.convert_job.start(job):
+            self.lbl_status.set("A conversion is already running.", "warn")
 
     def _on_progress(self, done: int, total: int, msg: str) -> None:
         if total > 0:
@@ -545,9 +578,8 @@ class IngestDialog(QtWidgets.QDialog):
             self.lbl_status.set(msg, "info")
 
     def _cancel(self) -> None:
-        if self.worker is not None:
-            self.worker.cancel()
-            self.lbl_status.set("Cancelling…", "warn")
+        self.convert_job.cancel()
+        self.lbl_status.set("Cancelling…", "warn")
 
     def _convert_done(self, res) -> None:
         self.btn_convert.setEnabled(True)
@@ -561,10 +593,9 @@ class IngestDialog(QtWidgets.QDialog):
         self.converted.emit(str(res.dest))
 
     def _failed(self, msg: str, tb: str) -> None:
-        self.btn_count.setEnabled(True)
-        self.btn_measure.setEnabled(True)
-        self.btn_convert.setEnabled(True)
-        self.btn_cancel.setEnabled(False)
+        # Button state belongs to whichever runner owns each button: this
+        # handler used to re-enable all four, which would un-disable a button
+        # whose own job was still running if two failed close together.
         log.error("ingest failed: %s\n%s", msg, tb)
         self.lbl_status.set(msg, "bad")
 
@@ -594,7 +625,7 @@ class IngestDialog(QtWidgets.QDialog):
         self.txt_plan.setPlainText("\n".join(lines))
 
     def closeEvent(self, ev) -> None:        # noqa: N802 - Qt naming
-        if self.worker is not None and self.worker.isRunning():
-            self.worker.cancel()
-            self.worker.wait(3000)
+        for job in (self.arena_job, self.inspect_job, self.measure_job,
+                    self.convert_job):
+            job.wait(3000)
         super().closeEvent(ev)

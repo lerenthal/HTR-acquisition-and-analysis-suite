@@ -56,7 +56,17 @@ class AnalysisTab(QtWidgets.QWidget):
         self.ctx = ctx
         self.pal = theme.palette(ctx.cfg.get("ui.theme", "light"))
         self.worker: W.Worker | None = None
+        self.run_job = W.JobRunner("analysis", self)
+        self.run_job.progressed.connect(self._on_progress)
+        self.run_job.finished.connect(self._on_done)
+        self.run_job.failed.connect(self._on_failed)
+        self.run_job.cancelled.connect(
+            lambda: self.lbl_run.set("Analysis cancelled.", "warn"))
         self._build()
+        self.run_job._button = self.btn_run
+        self.run_job._cancel_button = self.btn_cancel
+        self.run_job._progress = self.progress
+        self.btn_cancel.clicked.connect(self.run_job.cancel)
         self._load()
 
     # ------------------------------------------------------------------
@@ -716,22 +726,16 @@ class AnalysisTab(QtWidgets.QWidget):
         fps = self.effective_fps()
         baseline = entry.baseline_s
 
-        self.btn_run.setEnabled(False)
-        self.btn_cancel.setEnabled(True)
-        self.progress.setRange(0, 100)
-        self.progress.setValue(0)
-        self.lbl_run.set(f"Analysing {target.name}…", "info")
-
         def job(progress=None):
             sig = analysis.extract_signals(target, cfg, fps=fps, progress=progress)
             det = analysis.detect(sig, cfg, baseline_default_s=baseline)
             return sig, det
 
-        self.worker = W.Worker(job, parent=self)
-        self.worker.progressed.connect(self._on_progress)
-        self.worker.finishedOk.connect(self._on_done)
-        self.worker.failed.connect(self._on_failed)
-        self.worker.start()
+        if not self.run_job.start(job):
+            self.lbl_run.set("An analysis is already running. Cancel it first.",
+                             "warn")
+            return
+        self.lbl_run.set(f"Analysing {target.name}…", "info")
 
     def _on_progress(self, done: int, total: int, msg: str) -> None:
         if total > 0:
@@ -740,20 +744,17 @@ class AnalysisTab(QtWidgets.QWidget):
         self.lbl_run.set(f"{msg}: {done:,} of {total:,} frames", "info")
 
     def _cancel(self) -> None:
-        if self.worker is not None:
-            self.worker.cancel()
-            self.lbl_run.set("Cancelling…", "warn")
+        self.run_job.cancel()
+        self.lbl_run.set("Cancelling…", "warn")
 
     def _on_failed(self, msg: str, tb: str) -> None:
-        self.btn_run.setEnabled(True)
-        self.btn_cancel.setEnabled(False)
-        log.error("analysis failed: %s\n%s", msg, tb)
         self.lbl_run.set(msg, "bad")
 
     def _on_done(self, result) -> None:
+        if result is None:
+            return
         sig, det = result
-        self.btn_run.setEnabled(True)
-        self.btn_cancel.setEnabled(False)
+        # Button state is the runner's job now, not this handler's.
         self.ctx.set_analysis(sig, det)
 
         entry = self.ctx.entry
@@ -1035,6 +1036,4 @@ class AnalysisTab(QtWidgets.QWidget):
                          "shows in the Library and can be curated in Review.", "ok")
 
     def shutdown(self) -> None:
-        if self.worker is not None and self.worker.isRunning():
-            self.worker.cancel()
-            self.worker.wait(5000)
+        self.run_job.wait(5000)

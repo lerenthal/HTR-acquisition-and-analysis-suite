@@ -50,6 +50,41 @@ SPECTRUM_SOURCES = [
 # ==========================================================================
 # Spectrum
 # ==========================================================================
+def _scan_frames(video: str, cfg, cal, progress=None, want: int = 200):
+    """Segment frames spread across the file. Runs on a worker thread.
+
+    Returns (found, tested, clipped, areas). Kept at module level and free of
+    Qt so it can be called from a thread and tested without a GUI.
+    """
+    cap = cv2.VideoCapture(video)
+    if not cap.isOpened():
+        raise RuntimeError("could not reopen the file for a scan")
+    try:
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
+        idx = (np.linspace(0, max(total - 1, 0), want).astype(int)
+               if total > want else np.arange(max(total, 1)))
+        found, clipped = 0, 0
+        areas: list[float] = []
+        for k, i in enumerate(idx):
+            if progress is not None and not progress(k, len(idx), "scanning"):
+                break
+            cap.set(cv2.CAP_PROP_POS_FRAMES, int(i))
+            ok, frame = cap.read()
+            if not ok:
+                continue
+            gray = (cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                    if frame.ndim == 3 else frame)
+            seg = analysis.segment_frame(gray, cfg, cal)
+            if seg.clipped:
+                clipped += 1
+            if seg.head is not None:
+                found += 1
+                areas.append(seg.area_frac)
+        return found, len(idx), clipped, areas
+    finally:
+        cap.release()
+
+
 class SpectrumDialog(QtWidgets.QDialog):
     """Where is the energy in this recording, and is the band reachable?
 
@@ -266,7 +301,19 @@ class TuneDialog(QtWidgets.QDialog):
         self.cal: analysis.Calibration | None = None
         self.reader = W.FrameReader(self.video, cache=32)
         self.n_frames = 0
+        self.cal_job = W.JobRunner("tune-calibrate", self)
+        self.cal_job.finished.connect(self._calibrate_done)
+        self.cal_job.failed.connect(self._calibrate_failed)
+        self.scan_job = W.JobRunner("tune-scan", self)
+        self.scan_job.finished.connect(self._scan_done)
+        self.scan_job.failed.connect(
+            lambda m, tb: self.lbl_scan.set(f"Scan failed: {m}", "bad"))
         self._build()
+        # The buttons exist only after _build, so the runners are told about
+        # them here: a running job disables its own button, which is what
+        # makes a second press impossible rather than merely ignored.
+        self.cal_job._button = self.btn_cal
+        self.scan_job._button = self.btn_scan
         QtCore.QTimer.singleShot(0, self._open)
 
     # ------------------------------------------------------------------
@@ -497,16 +544,15 @@ class TuneDialog(QtWidgets.QDialog):
         self._calibrate()
 
     def _calibrate(self) -> None:
+        """Re-sample the file. Runs off the GUI thread: it was 4.7-9.9 s."""
         cfg = self._work_cfg()
         self.lbl_cal.set("Sampling the file…", "info")
-        QtWidgets.QApplication.processEvents()
-        try:
-            self.cal = analysis.calibrate(self.video, cfg)
-        except Exception as e:
-            log.exception("calibrate failed")
-            self.lbl_cal.set(f"Calibration failed: {e}", "bad")
-            return
-        cal = self.cal
+        if not self.cal_job.start(lambda progress=None: analysis.calibrate(
+                self.video, cfg)):
+            self.lbl_cal.set("Still sampling the previous settings…", "warn")
+
+    def _calibrate_done(self, cal) -> None:
+        self.cal = cal
         level = "ok" if (cal.hit_rate >= 0.90 and cal.area_cv <= 0.35) else (
             "warn" if cal.hit_rate >= 0.70 else "bad")
         self.lbl_cal.set(
@@ -520,39 +566,30 @@ class TuneDialog(QtWidgets.QDialog):
             log.info("tuning calibration: %s", "; ".join(cal.notes))
         self._refresh()
 
+    def _calibrate_failed(self, msg: str, tb: str) -> None:
+        self.lbl_cal.set(f"Calibration failed: {msg}", "bad")
+
     def _scan(self) -> None:
+        """Segment 200 frames spread across the file and score the result.
+
+        This was the single worst freeze in the application at 23.8 s, and the
+        frames it reads are exactly the expensive kind -- scattered seeks, so
+        the cost grows with recording length. It reports progress now, and it
+        can be cancelled, which matters because the operator runs it
+        repeatedly while hunting for a working kernel.
+        """
         if self.cal is None:
             return
         cfg = self._work_cfg()
+        cal = self.cal
+        video = str(self.video)
         self.lbl_scan.set("Scanning…", "info")
-        QtWidgets.QApplication.processEvents()
-        cap = cv2.VideoCapture(str(self.video))
-        if not cap.isOpened():
-            self.lbl_scan.set("Could not reopen the file for a scan.", "bad")
-            return
-        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or self.n_frames
-        want = 200
-        idx = (np.linspace(0, max(total - 1, 0), want).astype(int)
-               if total > want else np.arange(max(total, 1)))
-        found, areas, clipped = 0, [], 0
-        try:
-            for i in idx:
-                cap.set(cv2.CAP_PROP_POS_FRAMES, int(i))
-                ok, frame = cap.read()
-                if not ok:
-                    continue
-                gray = (cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                        if frame.ndim == 3 else frame)
-                seg = analysis.segment_frame(gray, cfg, self.cal)
-                if seg.clipped:
-                    clipped += 1
-                if seg.head is not None:
-                    found += 1
-                    areas.append(seg.area_frac)
-        finally:
-            cap.release()
-        n = max(1, len(idx))
-        hit = found / n
+        if not self.scan_job.start(_scan_frames, video, cfg, cal):
+            self.lbl_scan.set("A scan is already running.", "warn")
+
+    def _scan_done(self, res) -> None:
+        found, n, clipped, areas = res
+        hit = found / max(n, 1)
         cv_ = (float(np.std(areas) / np.mean(areas))
                if areas and np.mean(areas) > 0 else float("nan"))
         level = "ok" if (hit >= 0.90 and cv_ <= 0.35) else (
@@ -624,5 +661,7 @@ class TuneDialog(QtWidgets.QDialog):
         self.accept()
 
     def closeEvent(self, ev) -> None:        # noqa: N802 - Qt naming
+        self.cal_job.wait(3000)
+        self.scan_job.wait(3000)
         self.reader.close()
         super().closeEvent(ev)

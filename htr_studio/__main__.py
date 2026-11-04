@@ -55,18 +55,72 @@ def main(argv: list[str] | None = None) -> int:
 
     from .ui.main_window import MainWindow
 
+    # Rate limiting, per error signature.
+    #
+    # The previous handler showed one modal box per exception. Anything raised
+    # from a timer callback therefore produced one box per tick, and that is
+    # how an off-by-one in the preview histogram became an application that
+    # could not be used at all: boxes appeared faster than they could be
+    # dismissed, so the Acquisition tab could not be reached to stop a
+    # recording. A bug in a cosmetic readout must not be able to do that.
+    #
+    # So: the first occurrence of each distinct error is shown, repeats are
+    # counted and logged, and the same error is not shown again for a minute.
+    _seen: dict[str, float] = {}
+    _repeats: dict[str, int] = {}
+    QUIET_FOR_S = 60.0
+
     def excepthook(exc_type, exc, tb):
         """Never let a stray exception silently close the window mid-trial."""
+        import time
         import traceback
         text = "".join(traceback.format_exception(exc_type, exc, tb))
-        log.error("unhandled exception:\n%s", text)
+        frames = traceback.extract_tb(tb)
+        where = f"{frames[-1].filename}:{frames[-1].lineno}" if frames else "?"
+        sig = f"{exc_type.__name__}@{where}"
+        now = time.monotonic()
+        last = _seen.get(sig)
+        _repeats[sig] = _repeats.get(sig, 0) + 1
+        if last is not None and now - last < QUIET_FOR_S:
+            log.error("unhandled exception (%s, repeat %d, dialog suppressed): %s",
+                      sig, _repeats[sig], exc)
+            return
+        _seen[sig] = now
+        log.error("unhandled exception (%s):\n%s", sig, text)
+
+        # Only claim a recording is running if one actually is: the old text
+        # said so unconditionally, which sent people to the Acquisition tab
+        # after an error that had nothing to do with recording.
+        recording = False
         try:
-            QtWidgets.QMessageBox.critical(
-                None, "Unexpected error",
+            w = QtWidgets.QApplication.activeWindow()
+            for top in QtWidgets.QApplication.topLevelWidgets():
+                rec = getattr(getattr(top, "tab_acq", None), "rec", None)
+                if rec is not None and getattr(rec, "running", False):
+                    recording = True
+                    break
+            del w
+        except Exception:  # pragma: no cover - never fail inside the handler
+            log.exception("could not determine the recording state")
+
+        repeats = _repeats[sig]
+        extra = (f"\n\nThis has now happened {repeats} times; further copies "
+                 "are being logged instead of shown." if repeats > 1 else "")
+        try:
+            box = QtWidgets.QMessageBox(
+                QtWidgets.QMessageBox.Critical, "Unexpected error",
                 f"{exc}\n\nThe full traceback is in\n"
                 f"{paths.LOGS_DIR / 'htr_studio.log'}\n\n"
-                "If a recording was running it has not been stopped; check the "
-                "Acquisition tab.")
+                + ("A recording IS still running - it has not been stopped. "
+                   "Go to the Acquisition tab." if recording else
+                   "No recording is running.")
+                + extra)
+            copy = box.addButton("Copy details",
+                                 QtWidgets.QMessageBox.ActionRole)
+            box.addButton(QtWidgets.QMessageBox.Ok)
+            box.exec_()
+            if box.clickedButton() is copy:
+                QtWidgets.QApplication.clipboard().setText(text)
         except Exception:  # pragma: no cover
             pass
 

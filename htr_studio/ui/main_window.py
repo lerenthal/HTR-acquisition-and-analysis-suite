@@ -308,4 +308,12 @@ class MainWindow(QtWidgets.QMainWindow):
                 tab.shutdown()
             except Exception:  # pragma: no cover
                 log.exception("error shutting down %s", type(tab).__name__)
+        # Anything a tab could not stop in time was detached rather than
+        # destroyed; join it here, because the process is about to exit and a
+        # thread still running at interpreter teardown is the same abort by a
+        # slower route.
+        try:
+            W.JobRunner.join_all()
+        except Exception:  # pragma: no cover
+            log.exception("error joining detached workers")
         event.accept()

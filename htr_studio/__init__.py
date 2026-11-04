@@ -18,5 +18,5 @@ report         CSV/JSON/plot export
 ui.*           PyQt5 widgets
 """
 
-__version__ = "1.1.5"
+__version__ = "1.2.0-dev"
 __all__ = ["__version__"]

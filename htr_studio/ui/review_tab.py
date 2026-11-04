@@ -37,7 +37,9 @@ class ReviewTab(QtWidgets.QWidget):
         super().__init__(parent)
         self.ctx = ctx
         self.pal = theme.palette(ctx.cfg.get("ui.theme", "light"))
-        self.reader: W.FrameReader | None = None
+        self.reader: W.AsyncFrameReader | None = None
+        self.reader_path: Path | None = None
+        self._last_gray = None
         self.bursts: list[analysis.Burst] = []
         self.frame_index = 0
         self._syncing = False
@@ -223,10 +225,16 @@ class ReviewTab(QtWidgets.QWidget):
         target = entry.analysis_target
         if self.reader is not None:
             self.reader.close()
-        self.reader = W.FrameReader(target, int(self.ctx.cfg.get("review.frame_cache", 240)))
-        if self.reader.error:
-            self.lbl_status.set(self.reader.error, "bad")
+        self.reader = W.AsyncFrameReader(self)
+        self.reader.frameReady.connect(self._on_frame)
+        self.reader.failed.connect(
+            lambda m: self.lbl_status.set(m, "bad"))
+        if not self.reader.open(
+                target, int(self.ctx.cfg.get("review.frame_cache", 240))):
+            self.reader = None
             return
+        self.reader_path = Path(target)
+        self._last_gray = None
         fps = entry.fps_for_analysis() or self.reader.fps or 240.0
         self.fps = fps
         n = self.reader.n_frames or int(entry.duration_s * fps)
@@ -257,7 +265,8 @@ class ReviewTab(QtWidgets.QWidget):
         sig = self.ctx.signals
         if sig is None:
             return
-        if self.reader is None or Path(sig.source_path) != Path(self.reader.path):
+        if self.reader is None or self.reader_path is None \
+                or Path(sig.source_path) != self.reader_path:
             entry = self.ctx.entry
             if entry is not None:
                 self.load_entry(entry)
@@ -483,17 +492,29 @@ class ReviewTab(QtWidgets.QWidget):
         self._seek(int(round(float(line.value()) * self.fps)))
 
     def _show_frame(self, index: int) -> None:
+        """Ask for a frame. The paint happens in _on_frame when it arrives."""
         if self.reader is None:
             return
-        gray = self.reader.get(index)
-        if gray is None:
-            self.lbl_status.set(f"Could not decode frame {index}.", "warn")
+        self.reader.request(index)
+
+    def _on_frame(self, index: int, gray) -> None:
+        """A decoded frame arrived on the GUI thread. Draw it.
+
+        Overlays are indexed by the frame that was actually decoded, not by
+        whatever the slider reads now -- during a drag those differ, and
+        pairing a frame with another frame's head point would draw the arrow
+        in the wrong place.
+        """
+        if gray is None or self.reader is None:
             return
+        self._last_gray = gray
+        self.frame_index = index
         t = index / max(self.fps, 1e-9)
         overlays: dict = {}
         sig = self.ctx.signals
         if (self.chk_overlay.isChecked() and sig is not None
-                and Path(sig.source_path) == Path(self.reader.path)
+                and self.reader_path is not None
+                and Path(sig.source_path) == self.reader_path
                 and index < sig.n):
             overlays["centroid"] = (float(sig.cx[index]), float(sig.cy[index]))
             overlays["head"] = (float(sig.hx[index]), float(sig.hy[index]))
@@ -503,8 +524,7 @@ class ReviewTab(QtWidgets.QWidget):
         self.view.show_frame(gray, overlays, caption)
         self.lbl_time.setText(f"t = {t:.3f} s   frame {index:,}"
                               + ("   [in burst]" if in_burst else ""))
-        if not self.play_timer.isActive():
-            self.reader.prefetch(index + 1, 12)
+
 
     def _jump_burst(self, direction: int) -> None:
         if not self.bursts or not hasattr(self, "fps"):
@@ -527,7 +547,8 @@ class ReviewTab(QtWidgets.QWidget):
     def _save_frame(self) -> None:
         if self.reader is None:
             return
-        default = paths.EXPORTS_DIR / f"{Path(self.reader.path).stem}_f{self.frame_index}.png"
+        stem = self.reader_path.stem if self.reader_path else "frame"
+        default = paths.EXPORTS_DIR / f"{stem}_f{self.frame_index}.png"
         path, _ = QtWidgets.QFileDialog.getSaveFileName(
             self, "Save frame", str(default), "PNG (*.png)")
         if path and self.view.save_png(Path(path)):
@@ -541,9 +562,9 @@ class ReviewTab(QtWidgets.QWidget):
         if entry is None:
             return
         base = dict(entry.result) if entry.result else {}
-        if self.ctx.detection is not None and self.ctx.signals is not None \
-                and Path(self.ctx.signals.source_path) == Path(self.reader.path
-                                                               if self.reader else ""):
+        if (self.ctx.detection is not None and self.ctx.signals is not None
+                and self.reader_path is not None
+                and Path(self.ctx.signals.source_path) == self.reader_path):
             det, sig = self.ctx.detection, self.ctx.signals
             base.update({
                 "htr_studio_result_version": 1,

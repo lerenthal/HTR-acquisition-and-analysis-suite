@@ -60,6 +60,13 @@ class AcquisitionTab(QtWidgets.QWidget):
         self.preview_timer = QtCore.QTimer(self)
         self.preview_timer.setInterval(40)  # 25 Hz is plenty for a human eye
         self._hist_broken = False
+        self.probe_job = W.JobRunner("mode-probe", self)
+        self.probe_job.finished.connect(self._probe_done)
+        self.probe_job.failed.connect(self._job_failed)
+        self.verify_job = W.JobRunner("verify", self)
+        self.verify_job.finished.connect(
+            lambda v: self.lbl_rec.set(v.message, "ok" if v.ok else "warn"))
+        self.verify_job.failed.connect(self._job_failed)
         self.preview_timer.timeout.connect(self._tick_preview)
 
         self.rec_timer = QtCore.QTimer(self)
@@ -467,7 +474,6 @@ class AcquisitionTab(QtWidgets.QWidget):
     # ------------------------------------------------------------------
     def refresh_devices(self) -> None:
         self.lbl_device.set("Enumerating cameras…", "info")
-        QtWidgets.QApplication.processEvents()
 
         if not paths.is_windows():
             self.lbl_device.set(
@@ -628,10 +634,9 @@ class AcquisitionTab(QtWidgets.QWidget):
                                                    rtbufsize=rtbuf))
             return out
 
-        self.worker = W.Worker(job, parent=self)
-        self.worker.finishedOk.connect(self._probe_done)
-        self.worker.failed.connect(self._job_failed)
-        self.worker.start()
+        if not self.probe_job.start(job):
+            self.lbl_device.set("A probe is already running.", "warn")
+            self._set_busy(False)
 
     def _probe_done(self, results: list[ffmpeg_tools.ProbeResult]) -> None:
         self._set_busy(False)
@@ -1035,11 +1040,7 @@ class AcquisitionTab(QtWidgets.QWidget):
         def job(progress=None):
             return recorder.verify_recording(target, expected_fps, ffprobe)
 
-        self.worker = W.Worker(job, parent=self)
-        self.worker.finishedOk.connect(
-            lambda v: self.lbl_rec.set(v.message, "ok" if v.ok else "warn"))
-        self.worker.failed.connect(self._job_failed)
-        self.worker.start()
+        self.verify_job.start(job)
 
     # ------------------------------------------------------------------
     def _set_busy(self, busy: bool) -> None:
