@@ -38,6 +38,18 @@ class AppContext(QtCore.QObject):
         self.analysisChanged.emit()
 
     def set_entry(self, entry: library.Entry) -> None:
+        """The only writer of ``self.entry``.
+
+        Every tab that shows a file used to be told about a new one by hand,
+        by whichever method opened it -- and ``_open_in_analysis`` simply
+        forgot the Review tab, so Review kept the previous file's bursts
+        shaded on its plots while the Analysis tab worked on a different
+        clip. ``entryChanged`` existed for this and nothing was connected to
+        it. Now it is the mechanism: a tab added later subscribes once and
+        cannot be forgotten.
+        """
+        if entry is self.entry:
+            return
         self.entry = entry
         self.entryChanged.emit(entry)
 
@@ -87,6 +99,11 @@ class MainWindow(QtWidgets.QMainWindow):
                     self.tab_analysis, self.tab_batch, self.tab_settings):
             if hasattr(tab, "statusMessage"):
                 tab.statusMessage.connect(self._status)
+
+        # One entry change, every viewer follows. Both tabs are consumers of
+        # ctx.entry; neither writes it.
+        self.ctx.entryChanged.connect(self.tab_review.load_entry)
+        self.ctx.entryChanged.connect(self.tab_analysis.set_entry)
 
         # Library drives the other tabs.
         self.tab_lib.openInReview.connect(self._open_in_review)
@@ -150,14 +167,11 @@ class MainWindow(QtWidgets.QMainWindow):
         log.info("status: %s", msg)
 
     def _open_in_review(self, entry: library.Entry) -> None:
-        self.ctx.entry = entry
-        self.tab_review.load_entry(entry)
-        self.tab_analysis.set_entry(entry)
+        self.ctx.set_entry(entry)
         self.tabs.setCurrentWidget(self.tab_review)
 
     def _open_in_analysis(self, entry: library.Entry) -> None:
-        self.ctx.entry = entry
-        self.tab_analysis.set_entry(entry)
+        self.ctx.set_entry(entry)
         self.tabs.setCurrentWidget(self.tab_analysis)
 
     def _add_to_batch(self, entries: list) -> None:

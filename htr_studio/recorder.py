@@ -308,6 +308,12 @@ def explain_exit(rc: int | None, stderr_lines: list[str] | None = None) -> str:
         return (f"FFmpeg could not open the camera (exit {signed}, I/O error). "
                 "Either the requested mode is not supported, or something else "
                 "holds the camera open - close Windows Camera and any preview.")
+    if ("could not find video device" in text or "cannot find a device" in text
+            or "no such file or directory" in text):
+        return (f"FFmpeg could not find that camera (exit {signed}). The "
+                "DirectShow name must match exactly, including trailing "
+                "spaces - press Refresh and pick the device from the list "
+                "rather than typing it.")
     if "device or resource busy" in text or "in use" in text:
         return (f"The camera is already in use (exit {signed}). Close the other "
                 "program and try again.")
@@ -557,14 +563,18 @@ class Recorder:
                                 for k, v in asdict(self._stats).items()})
         if self.proc is not None and self.proc.poll() is None:
             st.wall_elapsed_s = time.perf_counter() - self._t_start
-            # The file size FFmpeg reports lags for the segment muxer.
-            if self.spec.is_segmented and st.size_bytes == 0:
-                try:
-                    folder = self.spec.target_path().parent
-                    st.size_bytes = sum(f.stat().st_size for f in folder.glob("*")
-                                        if f.is_file())
-                except OSError:
-                    pass
+        # FFmpeg's -stats line reports no size for the segment muxer, so the
+        # folder has to be measured instead. This used to sit inside the
+        # still-running branch above, which meant the final summary -- the one
+        # the operator actually reads -- said "0 B" for every segmented trial
+        # while the live readout during the same recording was correct.
+        if self.spec.is_segmented and st.size_bytes == 0:
+            try:
+                folder = self.spec.target_path().parent
+                st.size_bytes = sum(f.stat().st_size for f in folder.glob("*")
+                                    if f.is_file())
+            except OSError:
+                pass
         return st
 
     @property

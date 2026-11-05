@@ -26,6 +26,7 @@ client at a time. Starting a recording stops the preview first, and says so.
 from __future__ import annotations
 
 import logging
+import subprocess
 import time
 from pathlib import Path
 
@@ -43,6 +44,83 @@ log = logging.getLogger(__name__)
 #: alive even on a machine where a frame is expensive.
 PREVIEW_MIN_INTERVAL_MS = 40
 PREVIEW_MAX_INTERVAL_MS = 250
+
+#: How long "Check capture" records. Long enough for the sensor's exposure and
+#: gain to settle after the mode switch, short enough that nobody minds.
+CHECK_CAPTURE_S = 2.0
+
+
+def _check_capture(spec, cfg_paths: dict, progress=None) -> dict:
+    """Record a two-second clip with the real command, then measure the file.
+
+    This exists because the preview is not a preview of the recording, and
+    every honest reading of the code says so. The preview is OpenCV holding
+    the camera in whatever media type the DSHOW backend negotiated -- on the
+    B0634, YUY2, because the driver refuses MJPG to OpenCV -- at whatever
+    frame rate that mode runs, because the DSHOW backend's CAP_PROP_FPS is an
+    echo of what was set, not a negotiation result. FFmpeg then opens the same
+    camera in MJPEG at an explicit ``-framerate``, which dshow does honour.
+
+    Two different media types at two different frame rates means two different
+    exposure windows, and brightness is proportional to exposure time. A
+    preview whose mode allows 7.8 ms of integration will look several times
+    brighter than a 200 fps capture that physically cannot integrate for more
+    than 5 ms. No amount of pushing UVC controls fixes that, because it is not
+    a settings problem: it is the frame interval.
+
+    So rather than argue about it, measure it. Record with the exact command
+    the trial will use, decode the file, and report its own numbers. The file
+    is the only thing that tells the truth about what the analysis will see.
+    """
+    import cv2
+
+    out: dict = {"ok": False, "note": "", "metrics": None, "info": None}
+    if progress:
+        progress(1, 3, f"recording {CHECK_CAPTURE_S:.0f} s with the real command…")
+
+    rec = recorder.Recorder(spec, cfg_paths)
+    cmd = rec.build_command()
+    target = spec.target_path()
+    proc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                          text=True, errors="replace",
+                          **({"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)}
+                             if paths.is_windows() else {}))
+    if not target.is_file() or target.stat().st_size == 0:
+        tail = [ln for ln in (proc.stderr or "").splitlines() if ln.strip()][-6:]
+        out["note"] = recorder.explain_exit(proc.returncode, tail)
+        return out
+
+    if progress:
+        progress(2, 3, "measuring the file…")
+    out["info"] = ffmpeg_tools.probe_video(target, cfg_paths.get("ffprobe", ""),
+                                           count_frames=True)
+
+    cap = cv2.VideoCapture(str(target))
+    n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    # Skip the first 10%: the first frames after a mode switch are taken while
+    # the sensor is still settling and are not representative of the trial.
+    picks = [int(n * f) for f in (0.2, 0.4, 0.6, 0.8)] if n > 10 else [0]
+    mets = []
+    for idx in picks:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+        ok, frame = cap.read()
+        if not ok:
+            continue
+        gray = frame if frame.ndim == 2 else cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        mets.append(camera.frame_metrics(gray))
+    cap.release()
+    if not mets:
+        out["note"] = "the clip was written but no frame could be decoded from it"
+        return out
+
+    # The median frame by mean level, so one odd frame cannot set the verdict.
+    out["metrics"] = sorted(mets, key=lambda m: m.mean)[len(mets) // 2]
+    out["frames_sampled"] = len(mets)
+    out["path"] = target
+    out["ok"] = True
+    if progress:
+        progress(3, 3, "done")
+    return out
 
 
 class AcquisitionTab(QtWidgets.QWidget):
@@ -82,6 +160,11 @@ class AcquisitionTab(QtWidgets.QWidget):
         self.verify_job.finished.connect(
             lambda v: self.lbl_rec.set(v.message, "ok" if v.ok else "warn"))
         self.verify_job.failed.connect(self._job_failed)
+        self._check_was_previewing = False
+        self._preview_metrics_at_check = None
+        self.check_job = W.JobRunner("capture-check", self)
+        self.check_job.finished.connect(self._check_capture_done)
+        self.check_job.failed.connect(self._job_failed)
 
         self._build()
         W.no_wheel(self)
@@ -292,13 +375,32 @@ class AcquisitionTab(QtWidgets.QWidget):
         self.btn_preview = W.button("Start preview", "primary")
         self.btn_snapshot = W.button("Save snapshot")
         self.btn_snapshot.setEnabled(False)
+        self.btn_check_capture = W.button("Check capture")
+        self.check_job._button = self.btn_check_capture
+        self.btn_check_capture.setToolTip(
+            "Records a two-second clip with the exact command the trial will "
+            "use, then measures that file.\n\n"
+            "Worth doing whenever the lighting or the mode changes, because the "
+            "preview and the recording are not the same thing. The preview is "
+            "OpenCV holding the camera in whatever mode the DirectShow backend "
+            "negotiated - often YUY2, because the driver refuses MJPG to "
+            "OpenCV - at that mode's own frame rate. FFmpeg opens the same "
+            "camera in MJPEG at an explicit frame rate, which the driver does "
+            "honour. Different mode, different frame interval, different "
+            "exposure window, so a different brightness. The file is what the "
+            "analysis sees, so the file is what to judge.")
         row.addWidget(self.btn_preview)
         row.addWidget(self.btn_snapshot)
+        row.addWidget(self.btn_check_capture)
         row.addStretch(1)
         self.lbl_negotiated = QtWidgets.QLabel("")
         self.lbl_negotiated.setObjectName("hint")
         row.addWidget(self.lbl_negotiated)
         v.addLayout(row)
+
+        self.lbl_mode_warning = W.StatusLabel("", "info")
+        self.lbl_mode_warning.setVisible(False)
+        v.addWidget(self.lbl_mode_warning)
 
         self.view = W.FrameView()
         self.view.set_palette_tokens(self.pal)
@@ -310,7 +412,14 @@ class AcquisitionTab(QtWidgets.QWidget):
         self.t_clip = W.MetricTile("clipped", "-", "%")
         self.t_focus = W.MetricTile("focus")
         self.t_uniform = W.MetricTile("uniformity")
-        for t in (self.t_fps, self.t_contrast, self.t_clip, self.t_focus, self.t_uniform):
+        self.t_mean = W.MetricTile("mean level", "-", "/255")
+        self.t_mean.setToolTip(
+            "Average pixel value of the preview. Compare it with the mean that "
+            "'Check capture' reports for the recorded file - if the file is "
+            "much darker, the preview is running a longer exposure than the "
+            "capture frame rate allows.")
+        for t in (self.t_fps, self.t_mean, self.t_contrast, self.t_clip,
+                  self.t_focus, self.t_uniform):
             tiles.addWidget(t)
         v.addLayout(tiles)
 
@@ -322,6 +431,7 @@ class AcquisitionTab(QtWidgets.QWidget):
 
         self.btn_preview.clicked.connect(self._toggle_preview)
         self.btn_snapshot.clicked.connect(self._snapshot)
+        self.btn_check_capture.clicked.connect(self._check_capture)
         return g
 
     # ---- trial metadata ----
@@ -750,6 +860,7 @@ class AcquisitionTab(QtWidgets.QWidget):
             f"driver gave {a.width}x{a.height} @ {a.fps:.0f} {a.fourcc}")
         for wmsg in a.warnings:
             log.warning("preview: %s", wmsg)
+        self._warn_mode_mismatch(a)
         self.btn_preview.setText("Stop preview")
         self.btn_snapshot.setEnabled(True)
         self.preview_timer.start()
@@ -769,6 +880,64 @@ class AcquisitionTab(QtWidgets.QWidget):
             applied = self.preview.push(self._uvc())
             if applied.warnings:
                 self.lbl_negotiated.setText(" | ".join(applied.warnings)[:120])
+            self._warn_mode_mismatch(applied)
+
+    def _warn_mode_mismatch(self, applied) -> None:
+        """Say, in the window, when the preview cannot represent the capture.
+
+        Two independent reasons the recorded file will not look like the
+        preview, both of which were previously visible only as a line in the
+        log file:
+
+        **Different media type.** The DirectShow backend negotiates on
+        OpenCV's behalf and the B0634's driver refuses MJPG to it, falling
+        back to YUY2. FFmpeg asks for MJPEG explicitly and gets it. Those are
+        two different sensor modes with their own default exposure and gain
+        behaviour, and the UVC controls pushed while the camera is in one do
+        not necessarily carry into the other.
+
+        **Exposure longer than the capture frame interval.** This is the one
+        that actually makes the file darker, and it is physics, not a
+        setting: at 200 fps a frame lasts 5 ms, so the sensor cannot integrate
+        for the 7.8 ms that an exposure value of -7 asks for. The driver
+        clamps it. If the preview is running at a lower rate -- which it is
+        whenever the media type differs, because the DSHOW backend's
+        CAP_PROP_FPS is an echo of the request rather than a negotiated value
+        -- the preview gets the full 7.8 ms and the capture gets 5 ms or less.
+        Brightness is proportional to integration time, so the ratio of the
+        two is roughly the ratio of the brightness.
+
+        The right answer in that case is more light, not a longer exposure:
+        7.8 ms of integration smears a 78-98 Hz twitch across most of a
+        cycle, which is the signal this whole tool exists to measure.
+        """
+        msgs: list[str] = []
+        _, _, want_fps, want_pf = self._current_mode()
+        want_fourcc = "MJPG" if want_pf.startswith("mjp") else "YUY2"
+        got = (applied.fourcc or "").upper()
+        if got and got not in (want_fourcc.upper(), ""):
+            msgs.append(
+                f"the preview is running in {applied.fourcc}, but the recording "
+                f"will use {want_pf.upper()} - two different sensor modes, so "
+                "the brightness you see here is not the brightness you will get")
+
+        if not self.chk_auto.isChecked() and want_fps > 0:
+            want_ms = camera.exposure_hint_ms(self.sl_exposure.value())
+            frame_ms = 1000.0 / want_fps
+            if want_ms > frame_ms * 1.05:
+                msgs.append(
+                    f"exposure asks for {want_ms:.1f} ms but a frame at "
+                    f"{want_fps:.0f} fps lasts {frame_ms:.1f} ms, so the "
+                    f"driver will clamp it - expect the capture to be about "
+                    f"{want_ms / frame_ms:.1f}x darker than this preview. "
+                    "Add light rather than lengthening the exposure: at this "
+                    "rate a longer exposure would blur the twitch away")
+
+        if msgs:
+            self.lbl_mode_warning.set("  •  ".join(msgs), "warn")
+            self.lbl_mode_warning.setVisible(True)
+        else:
+            self.lbl_mode_warning.setVisible(False)
 
 
     def _draw_histogram(self, m) -> None:
@@ -819,6 +988,7 @@ class AcquisitionTab(QtWidgets.QWidget):
         self.view.show_frame(gray, {"crosshair": True},
                              caption=f"{gray.shape[1]}x{gray.shape[0]}")
         self.t_fps.set_value(f"{self.preview.measured_fps():.0f}")
+        self.t_mean.set_value(f"{m.mean:.0f}")
         self.t_contrast.set_value(f"{m.contrast:.0f}")
         self.t_clip.set_value(f"{m.clipped_high_pct:.1f}")
         self.t_focus.set_value(f"{m.focus_score:.0f}")
@@ -856,6 +1026,79 @@ class AcquisitionTab(QtWidgets.QWidget):
             self, "Save snapshot", str(default), "PNG (*.png)")
         if path and self.view.save_png(Path(path)):
             self.statusMessage.emit(f"Snapshot saved to {path}")
+
+    def _check_capture(self) -> None:
+        """Record two seconds with the real command and report the file."""
+        if self.rec is not None and self.rec.running:
+            W.warn_box(self, "Recording in progress",
+                       "Stop the trial recording first.")
+            return
+        if not self.cb_device.currentText():
+            W.warn_box(self, "No device", "Pick a DirectShow device first.")
+            return
+        # The camera admits one client at a time, so the preview has to go.
+        was_previewing = self.preview is not None and self.preview.running
+        if was_previewing:
+            self._stop_preview()
+        self._preview_metrics_at_check = self._last_metrics
+
+        import copy
+        spec = copy.deepcopy(self._spec())
+        spec.duration_s = CHECK_CAPTURE_S
+        spec.segment_enabled = False
+        spec.out_dir = paths.CACHE_DIR
+        spec.base_name = "capture_check"
+        self._check_was_previewing = was_previewing
+        self.check_job.start(_check_capture, spec,
+                             dict(self.ctx.cfg.get("paths", {}) or {}))
+
+    def _check_capture_done(self, res: dict) -> None:
+        if self._check_was_previewing:
+            self._start_preview()
+        if not res.get("ok"):
+            self.lbl_mode_warning.set(
+                "Check capture could not record: " + (res.get("note") or "unknown"),
+                "bad")
+            self.lbl_mode_warning.setVisible(True)
+            return
+
+        m = res["metrics"]
+        info = res.get("info")
+        pre = getattr(self, "_preview_metrics_at_check", None)
+        lines = [
+            f"<b>The recorded file</b>: mean {m.mean:.0f}/255, contrast "
+            f"{m.contrast:.0f}/255, {m.clipped_high_pct:.1f}% blown out, "
+            f"{m.clipped_low_pct:.0f}% crushed to black, uniformity "
+            f"{m.uniformity:.2f}, focus {m.focus_score:.0f}"]
+        if info is not None:
+            lines.append(
+                f"{info.width}x{info.height} {info.codec} at "
+                f"{info.true_fps:.1f} fps measured over {CHECK_CAPTURE_S:.0f} s")
+        if pre is not None and pre.mean > 1:
+            ratio = m.mean / pre.mean
+            verb = ("darker" if ratio < 0.95 else
+                    "brighter" if ratio > 1.05 else "the same brightness")
+            lines.append(
+                f"<b>Preview was mean {pre.mean:.0f}/255</b>, so the file is "
+                + (f"{1 / ratio:.1f}x {verb} than the preview."
+                   if ratio < 0.95 else
+                   f"{ratio:.1f}x {verb} than the preview."
+                   if ratio > 1.05 else "the same brightness as the preview."))
+        for level, text in m.verdicts:
+            lines.append(f"[{level}] {text}")
+
+        worst = "bad" if any(v[0] == "bad" for v in m.verdicts) else \
+                "warn" if any(v[0] == "warn" for v in m.verdicts) else "ok"
+        W.info_box(self, "What the recording actually looks like",
+                   "<br>".join(lines))
+        self.lbl_mode_warning.set(
+            f"Checked capture: file mean {m.mean:.0f}/255, contrast "
+            f"{m.contrast:.0f}/255"
+            + (f" (preview was {pre.mean:.0f})" if pre is not None else ""),
+            worst)
+        self.lbl_mode_warning.setVisible(True)
+        log.info("capture check: %s", " | ".join(
+            ln.replace("<b>", "").replace("</b>", "") for ln in lines))
 
     def _flicker(self) -> None:
         if self.preview is None or not self.preview.running:

@@ -574,7 +574,7 @@ class AnalysisTab(QtWidgets.QWidget):
     # Target selection
     # ------------------------------------------------------------------
     def set_entry(self, entry: library.Entry) -> None:
-        self.ctx.entry = entry
+        # ctx.entry is set by AppContext.set_entry, which is what called this.
         # A rate override belongs to the file it was worked out for. Carrying it
         # silently onto the next recording would put every timing figure in that
         # trial out by the same factor, so it is cleared here.

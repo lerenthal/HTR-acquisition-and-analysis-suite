@@ -120,9 +120,21 @@ class LabeledSlider(QtWidgets.QWidget):
         self.set_value(value)
 
     def _from_slider(self, raw: int) -> None:
+        """Mirror the slider into the spin box.
+
+        ``raw / self._scale`` is a float even when ``_scale`` is 1, because
+        Python 3 ``/`` always returns a float: 240 / 1 == 240.0. A QSpinBox
+        (the widget used whenever decimals == 0) refuses a float outright,
+        so dragging ANY integer slider raised TypeError here before
+        ``_emit`` could run -- the spin box never updated and, worse, the
+        valueChanged signal never fired, so the value was never pushed to
+        the camera. Every exposure/gain/brightness/contrast/gamma slider on
+        the Acquisition tab was dead on drag; only typing into the spin box
+        worked. Cast to the type the widget actually accepts.
+        """
         v = raw / self._scale
         self.spin.blockSignals(True)
-        self.spin.setValue(v)
+        self.spin.setValue(v if self._scale != 1 else int(raw))
         self.spin.blockSignals(False)
         self._emit(v)
 

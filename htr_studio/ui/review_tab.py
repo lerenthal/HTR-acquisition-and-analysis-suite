@@ -219,10 +219,31 @@ class ReviewTab(QtWidgets.QWidget):
     # ------------------------------------------------------------------
     # Loading
     # ------------------------------------------------------------------
+    def _clear_plots(self) -> None:
+        """Blank every trace and marker, so nothing survives a file change.
+
+        The three load branches below each cleared *some* of this and none
+        cleared the burst regions, so opening a clip with no analysis showed
+        empty curves under the previous clip's shaded bursts -- marks that
+        looked like results for the file just opened. The early return when
+        the reader fails to open left the whole previous file on screen the
+        same way. One reset, called before anything else, is the only shape
+        of this that cannot rot: a branch added later inherits it.
+        """
+        self.bursts = []
+        self.rejected = []
+        self.curve_angle.clear()
+        self.curve_env.clear()
+        self.line_thr.setValue(0.0)
+        self.plot_angle.setTitle("Head angle (deg)")
+        self.plot_env.setTitle("Band-pass envelope (deg/s)")
+        self._draw_regions()
+        self._fill_table()
+
     def load_entry(self, entry: library.Entry | None) -> None:
         if entry is None:
             return
-        self.ctx.entry = entry
+        self._clear_plots()
         target = entry.analysis_target
         if self.reader is not None:
             self.reader.close()
@@ -253,10 +274,6 @@ class ReviewTab(QtWidgets.QWidget):
         elif entry.result:
             self._load_from_saved(entry.result)
         else:
-            self.bursts = []
-            self.curve_angle.clear()
-            self.curve_env.clear()
-            self._fill_table()
             self.lbl_status.set(
                 "No analysis for this recording yet. Run one on the Analysis tab, "
                 "then come back to check the calls.", "info")
@@ -280,6 +297,7 @@ class ReviewTab(QtWidgets.QWidget):
             return
         self.bursts = [analysis.Burst.from_dict(b.to_dict()) for b in det.bursts]
         self.rejected = [analysis.Burst.from_dict(b.to_dict()) for b in det.rejected]
+        self.plot_angle.setTitle("Head angle (deg)")
         self._plot_traces(sig.t, sig.angle, det.envelope, det.threshold,
                           det.spec_t, det.spec_ratio)
         self._fill_table()
@@ -297,6 +315,15 @@ class ReviewTab(QtWidgets.QWidget):
         self.curve_angle.clear()
         self.curve_env.clear()
         self.line_thr.setValue(float(doc.get("threshold", 0) or 0))
+        # The saved result has burst times but no traces, so shaded regions
+        # float over empty axes. Say so in the titles: a marked band with no
+        # curve behind it otherwise reads as a leftover from another file.
+        self.plot_angle.setTitle("Head angle (deg) — saved burst times only, "
+                                 "re-run to see the trace")
+        self.plot_env.setTitle("Band-pass envelope — saved burst times only")
+        # The regions are the only thing on the plots, so they must be redrawn
+        # for THIS file.
+        self._draw_regions()
         self._fill_table()
         self.lbl_status.set(
             f"Loaded a saved analysis: {len(self.bursts)} candidate(s), "
