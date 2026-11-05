@@ -55,8 +55,10 @@ class AppContext(QtCore.QObject):
 
 
 class MainWindow(QtWidgets.QMainWindow):
-    def __init__(self, cfg: config.Config, initial_video: str | None = None):
+    def __init__(self, cfg: config.Config, initial_video: str | None = None,
+                 save_on_close: bool = True):
         super().__init__()
+        self.save_on_close = save_on_close
         self.ctx = AppContext(cfg)
         self.setWindowTitle(f"HTR Studio {__version__}  —  head-twitch response "
                             "acquisition and analysis")
@@ -315,7 +317,13 @@ class MainWindow(QtWidgets.QMainWindow):
                     "but the trial will be short. Close anyway?"):
                 event.ignore()
                 return
-        self._save_settings()
+        # Closing normally saves the settings; a startup check does not, so a
+        # diagnostic run cannot rewrite the operator's settings file. Saving
+        # reads every value back out of its widget, so it also quantises
+        # anything held to more precision than its spin box shows -- which is
+        # not something a check should do behind the operator's back.
+        if self.save_on_close:
+            self._save_settings()
         for tab in (self.tab_acq, self.tab_lib, self.tab_review,
                     self.tab_analysis, self.tab_batch, self.tab_settings):
             try:

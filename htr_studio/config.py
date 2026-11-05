@@ -164,7 +164,7 @@ _CORRECTIONS = [
 ]
 
 
-def _migrate(raw: dict[str, Any]) -> dict[str, Any]:
+def _migrate(raw: dict[str, Any]) -> tuple[dict[str, Any], int | None]:
     """Bring a stored settings document up to the current schema.
 
     Needed because a stored value wins over a default, which is normally
@@ -173,13 +173,17 @@ def _migrate(raw: dict[str, Any]) -> dict[str, Any]:
     settings file. The arena-floor fix was exactly that: the dataclass went
     to 0.25, the installed settings.json kept 0.45, and the rig carried on
     with the broken ceiling while the code claimed to have fixed it.
+
+    Returns the document and, when a migration happened, the version it came
+    from -- so the caller can persist it once rather than re-running it and
+    re-logging it on every launch.
     """
     if not raw:
-        return raw
+        return raw, None
     out = copy.deepcopy(raw)
     was = int(out.get("schema_version", 0) or 0)
     if was >= SCHEMA_VERSION:
-        return out
+        return out, None
     for dotted, old, new, why in _CORRECTIONS:
         parts = dotted.split(".")
         node = out
@@ -196,7 +200,7 @@ def _migrate(raw: dict[str, Any]) -> dict[str, Any]:
             log.warning("settings migration: %s %r -> %r. %s",
                         dotted, old, new, why)
     out["schema_version"] = SCHEMA_VERSION
-    return out
+    return out, was
 
 
 class Config:
@@ -204,7 +208,12 @@ class Config:
 
     def __init__(self, data: dict[str, Any] | None = None, file: Path | None = None):
         self.file = file or paths.SETTINGS_FILE
-        self.data = _deep_merge(DEFAULTS, _migrate(data or {}))
+        migrated, from_version = _migrate(data or {})
+        #: The schema version a migration ran from, or None if none did. The
+        #: launcher saves once when this is set, so the stored file stops
+        #: disagreeing with what the app is actually using.
+        self.migrated_from: int | None = from_version
+        self.data = _deep_merge(DEFAULTS, migrated)
 
     # ---- construction -------------------------------------------------
     @classmethod

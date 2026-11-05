@@ -20,6 +20,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--debug", action="store_true", help="verbose console logging")
     ap.add_argument("--selftest", action="store_true",
                     help="run the self-test and exit, without opening a window")
+    ap.add_argument("--check-startup", action="store_true",
+                    help="run the whole startup sequence, build the main "
+                         "window, and exit 0 without entering the event loop")
     args = ap.parse_args(argv if argv is not None else sys.argv[1:])
 
     from . import config, logging_setup, paths
@@ -138,9 +141,22 @@ def main(argv: list[str] | None = None) -> int:
 
     sys.excepthook = excepthook
 
-    win = MainWindow(cfg, initial_video=args.video)
+    win = MainWindow(cfg, initial_video=args.video,
+                     save_on_close=not args.check_startup)
     win.show()
     log.info("HTR Studio started")
+    if args.check_startup:
+        # Everything that happens before the window appears has now happened:
+        # settings loaded and migrated, defaults written, Qt configured, every
+        # module imported, every tab constructed. That is the part a test
+        # could not reach before, and the part that broke -- a startup crash
+        # shipped with 144 passing checks behind it, because every one of them
+        # built widgets directly and none of them came through here.
+        log.info("startup check passed")
+        print("startup check passed")
+        app.processEvents()
+        win.close()
+        return 0
     return app.exec_()
 
 

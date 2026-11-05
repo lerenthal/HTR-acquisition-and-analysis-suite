@@ -319,7 +319,13 @@ class AnalysisTab(QtWidgets.QWidget):
                    "raise its own threshold.")
         self.sp_thr_k = QtWidgets.QDoubleSpinBox()
         self.sp_thr_k.setRange(1, 30)
-        self.sp_thr_k.setDecimals(1)
+        # Two decimals, not one. Every setting is read back out of its widget
+        # when the app closes, so a spin box's precision is the precision the
+        # setting actually keeps. This is the number a control-video
+        # calibration produces and the one that decides the counts, so it is
+        # the last place to silently round 4.25 to 4.3.
+        self.sp_thr_k.setDecimals(2)
+        self.sp_thr_k.setSingleStep(0.25)
         W.form_row(form, "  robust sigma multiplier", self.sp_thr_k,
                    "median + k x MAD-sigma. Validated stable from k=4 to k=8 on the "
                    "synthetic benchmark; raise it if a noisy trial over-reports.")
