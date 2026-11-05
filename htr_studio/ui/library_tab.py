@@ -47,6 +47,7 @@ class LibraryTab(QtWidgets.QWidget):
         self.verify_job = W.JobRunner("library-verify", self)
         self.verify_job.failed.connect(self._job_failed)
         self._build()
+        W.no_wheel(self)
         self.scan_job._button = self.btn_rescan
         self.verify_job._button = self.btn_verify
         QtCore.QTimer.singleShot(0, self.rescan)

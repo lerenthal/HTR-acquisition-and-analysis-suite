@@ -45,6 +45,7 @@ class BatchTab(QtWidgets.QWidget):
         self.scan_job.failed.connect(
             lambda m, tb: self.lbl_status.set(f"Scan failed: {m}", "bad"))
         self._build()
+        W.no_wheel(self)
 
     # ------------------------------------------------------------------
     def _build(self) -> None:

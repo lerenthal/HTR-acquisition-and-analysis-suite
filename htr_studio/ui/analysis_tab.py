@@ -63,6 +63,7 @@ class AnalysisTab(QtWidgets.QWidget):
         self.run_job.cancelled.connect(
             lambda: self.lbl_run.set("Analysis cancelled.", "warn"))
         self._build()
+        W.no_wheel(self)
         self.run_job._button = self.btn_run
         self.run_job._cancel_button = self.btn_cancel
         self.run_job._progress = self.progress

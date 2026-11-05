@@ -32,6 +32,7 @@ class SettingsTab(QtWidgets.QWidget):
         self.tools_job.finished.connect(self._tools_done)
         self.env_job = W.JobRunner("environment", self)
         self._build()
+        W.no_wheel(self)
         # txt_env exists only after _build.
         self.env_job.finished.connect(self.txt_env.setPlainText)
         self._load()

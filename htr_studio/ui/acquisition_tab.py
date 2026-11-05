@@ -84,6 +84,7 @@ class AcquisitionTab(QtWidgets.QWidget):
         self.verify_job.failed.connect(self._job_failed)
 
         self._build()
+        W.no_wheel(self)
         self._load_from_config()
 
         self.preview_timer = QtCore.QTimer(self)
@@ -1102,8 +1103,10 @@ class AcquisitionTab(QtWidgets.QWidget):
         where = target.parent if spec.is_segmented else target
         if rc not in (0, 255) and st.frames == 0:
             self.lbl_rec.set(
-                f"FFmpeg exited with code {rc} and wrote no frames. "
-                + (st.errors[-1] if st.errors else "See the log for detail."), "bad")
+                recorder.explain_exit(rc, st.errors)
+                + "  No frames were written."
+                + (f"\n\nFFmpeg said: {st.errors[-1]}" if st.errors else ""),
+                "bad")
         else:
             msg = (f"Finished: {st.frames:,} frames, {W.hms(st.time_s)}, "
                    f"{W.human_bytes(st.size_bytes)} → {where}")

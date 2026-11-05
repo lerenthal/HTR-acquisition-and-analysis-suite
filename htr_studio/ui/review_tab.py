@@ -44,6 +44,7 @@ class ReviewTab(QtWidgets.QWidget):
         self.frame_index = 0
         self._syncing = False
         self._build()
+        W.no_wheel(self)
 
         self.play_timer = QtCore.QTimer(self)
         self.play_timer.timeout.connect(self._advance)

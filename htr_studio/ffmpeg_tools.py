@@ -21,6 +21,7 @@ import shutil
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Iterator
 
 from . import paths
 
@@ -39,31 +40,79 @@ class FFmpegMissing(RuntimeError):
 # --------------------------------------------------------------------------
 # Discovery
 # --------------------------------------------------------------------------
-def _candidates(tool: str, configured: str = "") -> list[Path]:
-    out: list[Path] = []
+def _candidates(tool: str, configured: str = "") -> "Iterator[Path]":
+    """Where ``tool`` might live, cheapest first, evaluated lazily.
+
+    This used to build a list, and one of the entries was
+
+        Path(LOCALAPPDATA).glob(f"**/ffmpeg-*/bin/{exe}")
+
+    a recursive walk of the whole of %LOCALAPPDATA% -- browser caches, package
+    caches, uv's Python installs, Temp. Building the list ran that walk every
+    time, before the loop had tested a single candidate, so the bundled binary
+    sitting at position two was found only after ten to twenty seconds of
+    scanning hundreds of thousands of unrelated files.
+
+    find_tool is called once per probe, so a library scan paid it per file: a
+    six-file rescan took two minutes on the reference machine, almost all of it
+    here. It never showed up in testing because the walk is inside a Windows
+    guard and the tests do not run on Windows.
+
+    A generator stops the walk from happening at all when an earlier candidate
+    matches, and the walk itself is now depth-limited.
+    """
     if configured:
-        out.append(Path(configured))
-    out.append(paths.FFMPEG_DIR / "bin" / paths.exe(tool))
-    out.append(paths.TOOLS_BIN / paths.exe(tool))
+        yield Path(configured)
+    yield paths.FFMPEG_DIR / "bin" / paths.exe(tool)
+    yield paths.TOOLS_BIN / paths.exe(tool)
     which = shutil.which(tool)
     if which:
-        out.append(Path(which))
-    if paths.is_windows():  # pragma: no cover
+        yield Path(which)
+    if paths.is_windows():  # pragma: no cover - Windows-only fallback
         local = os.environ.get("LOCALAPPDATA", "")
         if local:
-            # The reference host had a Gyan full build unpacked under LOCALAPPDATA.
-            out.extend(Path(local).glob(f"**/ffmpeg-*/bin/{paths.exe(tool)}"))
-    return out
+            # A Gyan build unpacked under LOCALAPPDATA, looked for at the two
+            # depths it is actually unpacked to rather than by walking the
+            # whole tree.
+            base = Path(local)
+            for pattern in (f"ffmpeg-*/bin/{paths.exe(tool)}",
+                            f"*/ffmpeg-*/bin/{paths.exe(tool)}"):
+                try:
+                    yield from base.glob(pattern)
+                except OSError:
+                    continue
+
+
+#: Resolved tool paths, keyed on (tool, configured). find_tool is called from
+#: every probe and every FFmpeg invocation; the answer changes only when the
+#: operator edits a path or reinstalls, and both go through clear_tool_cache.
+_TOOL_CACHE: dict[tuple[str, str], Path | None] = {}
+
+
+def clear_tool_cache() -> None:
+    """Forget resolved tool paths. Call after changing a configured path."""
+    _TOOL_CACHE.clear()
+    _VERSION_CACHE.clear()
 
 
 def find_tool(tool: str, configured: str = "") -> Path | None:
+    key = (tool, configured or "")
+    if key in _TOOL_CACHE:
+        hit = _TOOL_CACHE[key]
+        # Re-confirm cheaply: a cached path that has since been deleted must
+        # not be handed out, but this is one stat, not a directory walk.
+        if hit is None or hit.is_file():
+            return hit
+    found = None
     for c in _candidates(tool, configured):
         try:
             if c.is_file():
-                return c
+                found = c
+                break
         except OSError:
             continue
-    return None
+    _TOOL_CACHE[key] = found
+    return found
 
 
 def ffmpeg_path(configured: str = "") -> Path:

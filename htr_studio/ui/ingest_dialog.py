@@ -98,6 +98,7 @@ class IngestDialog(QtWidgets.QDialog):
             lambda m, tb: self.lbl_arena.set(f"Could not sample the file: {m}",
                                              "bad"))
         self._build()
+        W.no_wheel(self)
         self.arena_job._button = self.btn_find_arena
         self.inspect_job._button = self.btn_count
         self.measure_job._button = self.btn_measure

@@ -104,6 +104,7 @@ class SpectrumDialog(QtWidgets.QDialog):
         self._spec: analysis.SpectrumResult | None = None
         self._sugg: analysis.RateSuggestion | None = None
         self._build()
+        W.no_wheel(self)
         self._recompute()
 
     # ------------------------------------------------------------------

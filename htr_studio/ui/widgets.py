@@ -586,6 +586,40 @@ def form_row(layout: QtWidgets.QFormLayout, label: str,
     return widget
 
 
+class _NoWheel(QtCore.QObject):
+    """Swallow wheel events on controls that do not have focus.
+
+    Qt's spin boxes and combo boxes accept the wheel whether or not they are
+    focused, so scrolling a form changes whatever happens to be under the
+    pointer. On this application that is not a cosmetic annoyance: it silently
+    set the capture height to 320x245, a mode the camera does not have, and
+    the recording failed with a raw DirectShow I/O error. The same slip set the
+    segment length to 0.2 min. A control should change when it is used, not
+    when it is scrolled past.
+    """
+
+    def eventFilter(self, obj, ev):  # noqa: N802 - Qt naming
+        if ev.type() == QtCore.QEvent.Wheel and not obj.hasFocus():
+            ev.ignore()
+            return True
+        return False
+
+
+_NO_WHEEL = _NoWheel()
+
+
+def no_wheel(root: QtWidgets.QWidget) -> int:
+    """Protect every spin box and combo box under ``root``. Returns the count."""
+    kinds = (QtWidgets.QAbstractSpinBox, QtWidgets.QComboBox)
+    n = 0
+    for w in root.findChildren(QtWidgets.QWidget):
+        if isinstance(w, kinds):
+            w.installEventFilter(_NO_WHEEL)
+            w.setFocusPolicy(QtCore.Qt.StrongFocus)
+            n += 1
+    return n
+
+
 def stop_jobs(owner: object, msec: int = 5000) -> int:
     """Stop every JobRunner attribute of ``owner``. Returns how many it found.
 

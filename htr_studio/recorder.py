@@ -258,6 +258,18 @@ def preflight(spec: RecordingSpec, cfg_paths: dict | None = None,
     elif exp is not None:
         out.append(Check("Exposure mode", True, f"manual, value {exp}"))
 
+    # A mode the camera does not offer is refused by DirectShow with a generic
+    # I/O error, after the animal is already in the arena. Common sizes are
+    # multiples of 8 or 16; an odd one is almost always a mis-scrolled spin box
+    # (320x245 for 320x240 cost a trial on the reference rig).
+    if spec.width % 8 or spec.height % 8:
+        out.append(Check(
+            "Capture size", False,
+            f"{spec.width}x{spec.height} is not a size cameras normally offer - "
+            "they are multiples of 8. Check the W and H boxes; a stray mouse "
+            "wheel over them is the usual cause. Press 'List modes' to see what "
+            "this camera actually supports.", fatal=True))
+
     if spec.expected_fps() < 200:
         out.append(Check(
             "Temporal resolution", False,
@@ -274,6 +286,40 @@ def preflight(spec: RecordingSpec, cfg_paths: dict | None = None,
 # --------------------------------------------------------------------------
 # Live statistics
 # --------------------------------------------------------------------------
+def explain_exit(rc: int | None, stderr_lines: list[str] | None = None) -> str:
+    """Turn an FFmpeg exit status into something an operator can act on.
+
+    Windows reports a negative exit as a large unsigned number, so a DirectShow
+    I/O failure arrives as 4294967291 -- a number with no meaning to anyone.
+    The common cause is asking the camera for a mode it does not have, which
+    DirectShow refuses with "Could not set video options" and then a generic
+    I/O error, so the mode is worth naming in the message.
+    """
+    if rc is None:
+        return "FFmpeg is still running."
+    signed = rc - 2 ** 32 if rc > 2 ** 31 else rc
+    text = " ".join(stderr_lines or []).lower()
+    if "could not set video options" in text:
+        return (f"FFmpeg could not open the camera (exit {signed}): the driver "
+                "refused the requested capture mode. The size, frame rate or "
+                "pixel format is not one this camera offers - press 'List "
+                "modes' and pick a row, or use a preset.")
+    if "i/o error" in text or signed == -5:
+        return (f"FFmpeg could not open the camera (exit {signed}, I/O error). "
+                "Either the requested mode is not supported, or something else "
+                "holds the camera open - close Windows Camera and any preview.")
+    if "device or resource busy" in text or "in use" in text:
+        return (f"The camera is already in use (exit {signed}). Close the other "
+                "program and try again.")
+    if "no space left" in text:
+        return f"The disk filled up (exit {signed}). The recording stopped."
+    if signed == 0:
+        return "FFmpeg finished normally."
+    return (f"FFmpeg exited with {signed}"
+            + (f" (reported by Windows as {rc})" if signed != rc else "")
+            + ". See the log for its output.")
+
+
 @dataclass
 class RecordStats:
     frames: int = 0
@@ -465,7 +511,8 @@ class Recorder:
         if buf.strip():
             self._handle_line(buf.strip())
         rc = self.proc.wait()
-        log.info("ffmpeg exited with %s", rc)
+        log.info("ffmpeg exited with %s: %s", rc,
+                 explain_exit(rc, self._stats.errors))
         with self._lock:
             self._stats.wall_elapsed_s = time.perf_counter() - self._t_start
         self.spec.meta.ended_iso = datetime.now().astimezone().isoformat(timespec="seconds")
