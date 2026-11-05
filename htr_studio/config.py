@@ -257,12 +257,26 @@ class Config:
         return Path(r) if r else paths.RECORDINGS_DIR
 
     def write_defaults_reference(self) -> None:
-        """Dump the shipped defaults next to settings.json for reference."""
+        """Dump the shipped defaults next to settings.json for reference.
+
+        Rewritten whenever the stored version is older than the current
+        schema, not only when the file is absent. The shipped copy in the
+        repository had gone stale at schema 2 with ``max_area_frac: 0.45`` in
+        it -- a read-only reference that documented the wrong value is worse
+        than none, because it is the file someone checks when a setting
+        looks odd.
+        """
         try:
             paths.CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-            paths.DEFAULT_SETTINGS_FILE.write_text(
-                json.dumps(DEFAULTS, indent=2), encoding="utf-8"
-            )
+            f = paths.DEFAULT_SETTINGS_FILE
+            if f.exists():
+                try:
+                    old = json.loads(f.read_text(encoding="utf-8"))
+                    if int(old.get("schema_version", 0) or 0) >= SCHEMA_VERSION:
+                        return
+                except (OSError, json.JSONDecodeError):
+                    pass
+            f.write_text(json.dumps(DEFAULTS, indent=2), encoding="utf-8")
         except OSError:
             pass
 

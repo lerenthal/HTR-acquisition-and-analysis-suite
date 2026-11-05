@@ -29,6 +29,18 @@ def main(argv: list[str] | None = None) -> int:
     log = logging.getLogger("htr_studio")
 
     cfg = config.Config.load()
+    # Persist a schema migration the first time it runs. Config.load applies
+    # it in memory on every start, so the app always uses the corrected
+    # values either way -- but leaving the file saying 0.45 while the app
+    # uses 0.25 makes settings.json a liar, and repeats the migration warning
+    # in the log every launch. Written once, on the launch that migrated.
+    if cfg.migrated_from is not None:
+        log.warning("settings file migrated from schema %s to %s; saving",
+                    cfg.migrated_from, config.SCHEMA_VERSION)
+        try:
+            cfg.save()
+        except OSError as e:          # read-only install: carry on regardless
+            log.warning("could not save the migrated settings: %s", e)
     cfg.write_defaults_reference()
     config.write_capture_presets_reference()
 
