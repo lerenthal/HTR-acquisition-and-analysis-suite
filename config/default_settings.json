@@ -1,5 +1,5 @@
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "camera": {
     "device_name": "Arducam ezBOX VGA GS Mono",
     "opencv_index": -1,
@@ -16,6 +16,11 @@
     "contrast": 32,
     "gamma": 100,
     "apply_uvc_before_record": true,
+    "preview_mode": "capture",
+    "preview_display_fps": 25,
+    "preview_reopen_debounce_ms": 500,
+    "flicker_seconds": 2.0,
+    "mains_hz": 50.0,
     "rtbufsize": "512M",
     "thread_queue_size": 4096
   },
@@ -31,13 +36,48 @@
     "write_sidecar": true,
     "auto_verify_after_record": true
   },
+  "review": {
+    "frame_cache": 240,
+    "overlay_tracking": true,
+    "overlay_trace_seconds": 2.0
+  },
+  "report": {
+    "bin_seconds": 60,
+    "t0_relative": true,
+    "export_plots": true,
+    "export_signals": false
+  },
+  "ui": {
+    "theme": "light",
+    "last_tab": 0,
+    "window_geometry": "",
+    "plot_antialias": true
+  },
+  "paths": {
+    "ffmpeg": "",
+    "ffprobe": "",
+    "dlc_python": ""
+  },
   "analysis": {
+    "segmentation": "auto",
     "polarity": "auto",
     "threshold_mode": "otsu",
     "threshold_value": 100,
+    "bg_samples": 40,
+    "bg_threshold_value": 0,
+    "roi_mode": "none",
+    "roi_frac": [
+      0.0,
+      0.0,
+      1.0,
+      1.0
+    ],
     "min_area_frac": 0.004,
-    "max_area_frac": 0.45,
+    "max_area_frac": 0.25,
+    "reject_edge_blobs": false,
+    "edge_margin_px": 2,
     "morph_kernel": 5,
+    "core_kernel": 0,
     "angle_source": "headpoint",
     "max_gap_ms": 60.0,
     "detector": "angle_bandpass",
@@ -78,27 +118,5 @@
     "workers": 0,
     "max_frames": 0,
     "progress_every": 2000
-  },
-  "review": {
-    "frame_cache": 240,
-    "overlay_tracking": true,
-    "overlay_trace_seconds": 2.0
-  },
-  "report": {
-    "bin_seconds": 60,
-    "t0_relative": true,
-    "export_plots": true,
-    "export_signals": false
-  },
-  "ui": {
-    "theme": "light",
-    "last_tab": 0,
-    "window_geometry": "",
-    "plot_antialias": true
-  },
-  "paths": {
-    "ffmpeg": "",
-    "ffprobe": "",
-    "dlc_python": ""
   }
 }
