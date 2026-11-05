@@ -23,7 +23,7 @@ log = logging.getLogger(__name__)
 # --------------------------------------------------------------------------
 # Rationale for the scientific defaults is in docs/PIPELINE_REVIEW.md.
 DEFAULTS: dict[str, Any] = {
-    "schema_version": 2,
+    "schema_version": 3,
     "camera": {
         # Substring matched case-insensitively against the dshow device names.
         "device_name": "Arducam ezBOX VGA GS Mono",
@@ -45,6 +45,21 @@ DEFAULTS: dict[str, Any] = {
         "contrast": 32,
         "gamma": 100,
         "apply_uvc_before_record": True,
+        # Live preview. "capture" runs the preview through FFmpeg with the
+        # recorder's own DirectShow arguments, so the picture is the one that
+        # will be written -- same media type, frame rate and exposure window.
+        # "opencv" is the responsive preview, which on this camera negotiates
+        # YUY2 at a different rate and so shows a different brightness.
+        "preview_mode": "capture",
+        # Frames per second shipped down the preview pipe. The camera still
+        # runs at the capture rate; this only decimates what is displayed.
+        "preview_display_fps": 25,
+        # FFmpeg holds the device, so applying a UVC control means closing and
+        # reopening it. A slider drag emits a change per pixel of travel, so
+        # the reopen waits this long after the last one.
+        "preview_reopen_debounce_ms": 500,
+        "flicker_seconds": 2.0,
+        "mains_hz": 50.0,
         "rtbufsize": "512M",
         # FFmpeg's own default is 8 packets, which at 240 fps is 33 ms of
         # tolerance for a disk stall - less than a single NTFS flush. This is
@@ -64,47 +79,8 @@ DEFAULTS: dict[str, Any] = {
         "write_sidecar": True,
         "auto_verify_after_record": True,
     },
-    "analysis": {
-        # ---- segmentation of the mouse ----
-        "polarity": "auto",  # auto | dark_on_light | light_on_dark
-        "threshold_mode": "otsu",  # otsu | fixed
-        "threshold_value": 100,
-        "min_area_frac": 0.004,  # fraction of frame area
-        "max_area_frac": 0.45,
-        "morph_kernel": 5,
-        # ---- head angle estimator ----
-        "angle_source": "headpoint",  # headpoint | ellipse | moments
-        "max_gap_ms": 60.0,  # interpolate invalid runs shorter than this
-        # ---- detector ----
-        "detector": "angle_bandpass",  # angle_bandpass | motion_spectral | both_agree | either
-        "band_low_hz": 60.0,
-        "band_high_hz": 110.0,
-        "filter_order": 4,
-        "envelope_smooth_ms": 15.0,
-        "threshold_source": "baseline",  # baseline | whole | manual
-        "threshold_k": 6.0,  # robust sigma multiplier
-        "threshold_manual": 0.0,
-        "threshold_low_frac": 0.5,
-        "baseline_window_s": [0.0, 0.0],  # [0,0] -> use recording.baseline_seconds / whole file
-        "merge_gap_ms": 60.0,
-        "min_burst_ms": 45.0,
-        "max_burst_ms": 600.0,
-        "require_freq_hz": [55.0, 125.0],  # dominant in-burst frequency gate
-        "min_half_cycles": 6,  # Halberstadt 2014: 5-11 oscillations per burst
-        "max_invalid_frac": 0.25,  # reject bursts sitting on lost tracking
-        # motion-spectral detector
-        "spec_window_ms": 256.0,
-        "spec_overlap": 0.75,
-        "spec_signal_band": [70.0, 110.0],
-        "spec_noise_band": [8.0, 50.0],
-        "spec_ratio_k": 5.0,
-        "spec_power_k": 6.0,
-        "spec_smooth_steps": 3,
-        # ---- performance ----
-        "workers": 0,  # 0 = auto
-        "max_frames": 0,  # 0 = no cap (streaming, so RAM is not a constraint)
-        "progress_every": 2000,
-    },
+    # "analysis" is filled in below from analysis.AnalysisConfig itself --
+    # see _analysis_defaults(). It is NOT written out by hand here.
     "review": {
         "frame_cache": 240,
         "overlay_tracking": True,
@@ -130,6 +106,32 @@ DEFAULTS: dict[str, Any] = {
 }
 
 
+def _analysis_defaults() -> dict:
+    """The analysis defaults, taken from the dataclass that documents them.
+
+    This used to be a hand-written copy of :class:`analysis.AnalysisConfig`'s
+    field defaults, and it drifted, which is what a duplicated constant
+    always eventually does. The copy still carried ``max_area_frac: 0.45``
+    after the dataclass had been lowered to 0.25 -- 0.45 being the ceiling
+    that let a 33% blob, the lit arena floor, be accepted as the animal. So a
+    fresh install wrote 0.45 into its settings file, the app read the settings
+    file in preference to the dataclass, and the fix was only half applied;
+    "Reset to defaults" then restored the broken value. Eight other fields
+    were simply missing, so they only ever got their dataclass value by
+    accident of absence.
+
+    Deriving it removes the possibility: there is one place a default lives,
+    next to the comment explaining why it has that value.
+    """
+    from .analysis import AnalysisConfig          # local: avoids a cycle
+    d = AnalysisConfig().to_dict()
+    # progress_every is a config-only knob; to_dict already carries it.
+    return d
+
+
+DEFAULTS["analysis"] = _analysis_defaults()
+
+
 def _deep_merge(base: dict, override: dict) -> dict:
     out = copy.deepcopy(base)
     for k, v in (override or {}).items():
@@ -140,12 +142,69 @@ def _deep_merge(base: dict, override: dict) -> dict:
     return out
 
 
+SCHEMA_VERSION = 3
+
+#: Values a stored settings file may hold that are now known to be wrong,
+#: with the version that corrects them. Each entry is
+#: ``(dotted key, exact stored value to replace, new value, why)``. Matching
+#: on the *exact* old default is deliberate: an operator who deliberately
+#: chose some other number keeps it, while the one who simply inherited a
+#: bad default gets the fix.
+_CORRECTIONS = [
+    ("analysis.max_area_frac", 0.45, 0.25,
+     "0.45 let a blob covering nearly half the frame be accepted as the "
+     "animal, which is how the lit arena floor (33% of frame, perfectly "
+     "stable) came to be tracked instead of the mouse. The real animal "
+     "measures 0.9-4% of the frame, so 0.25 is still several times its size."),
+    ("analysis.core_kernel", 9, 0,
+     "a fixed 9 px tail-suppression kernel is right for a 320x240 frame and "
+     "far too small for a larger one, where it left the tail attached and "
+     "put the head arrow on the wrong end. 0 means measure it from the "
+     "animal's own width."),
+]
+
+
+def _migrate(raw: dict[str, Any]) -> dict[str, Any]:
+    """Bring a stored settings document up to the current schema.
+
+    Needed because a stored value wins over a default, which is normally
+    right -- it is how an operator's choices survive an upgrade -- but means
+    a default corrected in the code does not reach a rig that already has a
+    settings file. The arena-floor fix was exactly that: the dataclass went
+    to 0.25, the installed settings.json kept 0.45, and the rig carried on
+    with the broken ceiling while the code claimed to have fixed it.
+    """
+    if not raw:
+        return raw
+    out = copy.deepcopy(raw)
+    was = int(out.get("schema_version", 0) or 0)
+    if was >= SCHEMA_VERSION:
+        return out
+    for dotted, old, new, why in _CORRECTIONS:
+        parts = dotted.split(".")
+        node = out
+        for p in parts[:-1]:
+            if not isinstance(node, dict) or p not in node:
+                node = None
+                break
+            node = node[p]
+        if not isinstance(node, dict):
+            continue
+        key = parts[-1]
+        if key in node and node[key] == old:
+            node[key] = new
+            log.warning("settings migration: %s %r -> %r. %s",
+                        dotted, old, new, why)
+    out["schema_version"] = SCHEMA_VERSION
+    return out
+
+
 class Config:
     """Dotted-path access to the settings document."""
 
     def __init__(self, data: dict[str, Any] | None = None, file: Path | None = None):
         self.file = file or paths.SETTINGS_FILE
-        self.data = _deep_merge(DEFAULTS, data or {})
+        self.data = _deep_merge(DEFAULTS, _migrate(data or {}))
 
     # ---- construction -------------------------------------------------
     @classmethod

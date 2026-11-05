@@ -24,11 +24,15 @@ property dialog remains available as the authoritative control.
 from __future__ import annotations
 
 import logging
+import subprocess
+import threading
 import time
 from dataclasses import dataclass, field
 
 import cv2
 import numpy as np
+
+from . import paths
 
 log = logging.getLogger(__name__)
 
@@ -350,13 +354,27 @@ def flicker_test(cap: "cv2.VideoCapture", seconds: float = 2.0,
         means.append(float(g.mean()))
     elapsed = time.perf_counter() - t0
 
+    return flicker_from_means(
+        means, nominal_fps or (len(means) / max(elapsed, 1e-6)), mains_hz)
+
+
+def flicker_from_means(means: "list[float] | np.ndarray", fps: float,
+                       mains_hz: float = 50.0) -> FlickerResult:
+    """The spectrum half of :func:`flicker_test`, over per-frame mean levels.
+
+    Split out so the measurement can be made from any source of frames. It
+    matters most at the *capture* frame rate: whether a PWM ripple aliases
+    into the 55-125 Hz band depends on the sampling rate, so a verdict taken
+    from a 25 fps preview says nothing useful about a 200 fps recording.
+    """
+    res = FlickerResult(mains_hz=mains_hz)
     res.frames = len(means)
     if res.frames < 32:
         res.verdict = "not enough frames captured to judge flicker"
         res.level = "warn"
         return res
 
-    res.fps = nominal_fps if nominal_fps > 0 else res.frames / max(elapsed, 1e-6)
+    res.fps = float(fps)
     x = np.asarray(means, dtype=np.float64)
     baseline = float(np.mean(x))
     # Remove slow drift (auto-gain hunting, warm-up) so only fast ripple remains.
@@ -498,3 +516,340 @@ class CameraPreview:
 
     def __exit__(self, *exc) -> None:
         self.stop()
+
+
+# --------------------------------------------------------------------------
+# True preview: the capture pipeline itself
+# --------------------------------------------------------------------------
+class CapturePreview:
+    """Preview through FFmpeg, with the recorder's own DirectShow arguments.
+
+    Why this exists. :class:`CameraPreview` is OpenCV, and on Windows the
+    DSHOW backend negotiates on OpenCV's behalf: ask the B0634 for MJPG and
+    the driver hands back YUY2, and ``CAP_PROP_FPS`` echoes the requested
+    rate rather than reporting what was agreed. FFmpeg, asked for
+    ``-vcodec mjpeg -framerate 200``, gets exactly that. Two different media
+    types at two different frame rates have two different exposure windows,
+    and since brightness follows integration time, the OpenCV preview can be
+    several times brighter than the file. An operator setting lighting
+    against that preview is setting it against the wrong picture.
+
+    So this class opens the camera with ``recorder.dshow_input_args(spec)``
+    -- the same list the recording uses, not a copy of it -- and decodes to
+    8-bit gray on stdout. What appears here is what will be written, mode,
+    rate, exposure clamp and all.
+
+    The cost. FFmpeg holds the device, so UVC controls cannot be pushed into
+    a running preview the way :meth:`CameraPreview.push` does: the Acquisition
+    tab stops this, applies the control, and reopens. Opening a DirectShow
+    graph takes about a second, which is the blink the operator sees.
+
+    Frame rate on the pipe. The camera runs at the capture rate but a preview
+    needs about 25 fps, so an ``fps`` filter decimates on FFmpeg's side.
+    Decoding every frame first is unavoidable -- the decimation has to happen
+    after decode -- but at QVGA that is cheap, and it keeps the pipe at
+    320x240x25 bytes/s rather than eight times that.
+
+    Threading. A pipe read blocks until a whole frame has arrived, so reading
+    it from the GUI thread would stall the window for up to a frame interval
+    -- measured at 89 ms on the first tick, which is exactly the kind of
+    "reacts slowly to button presses" this codebase has already been through
+    once. A reader thread keeps the pipe drained and holds only the newest
+    frame; :meth:`read` takes that frame without blocking and returns None
+    when nothing new has arrived. One slot, not a queue: a preview that falls
+    behind should skip to the live edge, never work through a backlog.
+    """
+
+    def __init__(self, spec, cfg_paths: dict | None = None,
+                 display_fps: float = 25.0):
+        self.spec = spec
+        self.cfg_paths = cfg_paths or {}
+        self.display_fps = max(1.0, float(display_fps))
+        self.proc: "subprocess.Popen | None" = None
+        self.width = int(spec.width)
+        self.height = int(spec.height)
+        self.command: list[str] = []
+        self._frames = 0
+        self._t0 = 0.0
+        self._last_err = ""
+        self._stderr: list[str] = []
+        self._err_thread: threading.Thread | None = None
+        self._frame_thread: threading.Thread | None = None
+        self._latest: "np.ndarray | None" = None
+        self._dropped = 0
+        self._stopping = threading.Event()
+        self._lock = threading.Lock()
+
+    # ---- command ----
+    def build_command(self) -> list[str]:
+        from . import ffmpeg_tools, recorder
+        ff = ffmpeg_tools.ffmpeg_path(self.cfg_paths.get("ffmpeg", ""))
+        return ([str(ff), "-hide_banner", "-loglevel", "warning", "-nostdin"]
+                + recorder.dshow_input_args(self.spec)
+                + ["-an",
+                   "-vf", f"fps={self.display_fps:g}",
+                   "-pix_fmt", "gray", "-f", "rawvideo", "-"])
+
+    # ---- lifecycle ----
+    def start(self) -> bool:
+        self.stop()
+        self.command = self.build_command()
+        log.info("true preview: %s", " ".join(self.command))
+        creation = {}
+        if paths.is_windows():  # pragma: no cover - Windows only
+            creation["creationflags"] = getattr(
+                subprocess, "CREATE_NO_WINDOW", 0x08000000)
+        try:
+            self.proc = subprocess.Popen(
+                self.command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                stdin=subprocess.DEVNULL, bufsize=0, **creation)
+        except OSError as e:
+            self._last_err = f"could not start FFmpeg: {e}"
+            self.proc = None
+            return False
+        self._frames = 0
+        self._dropped = 0
+        self._t0 = time.perf_counter()
+        self._stderr = []
+        self._latest = None
+        self._stopping.clear()
+        self._err_thread = threading.Thread(target=self._drain_stderr, daemon=True)
+        self._err_thread.start()
+        self._frame_thread = threading.Thread(target=self._drain_frames, daemon=True)
+        self._frame_thread.start()
+        return True
+
+    def _drain_frames(self) -> None:
+        """Keep the pipe empty, holding only the newest frame.
+
+        Runs off the GUI thread, so a blocking read costs nothing visible.
+        Frames that arrive while the last one is still unread are counted and
+        discarded -- the preview wants the live edge, not a backlog.
+        """
+        proc = self.proc
+        if proc is None or proc.stdout is None:
+            return
+        need = self.width * self.height
+        while not self._stopping.is_set():
+            buf = bytearray()
+            while len(buf) < need:
+                try:
+                    chunk = proc.stdout.read(need - len(buf))
+                except (OSError, ValueError):  # pipe closed under us
+                    chunk = b""
+                if not chunk:
+                    if self._stopping.is_set():
+                        return
+                    from . import recorder
+                    with self._lock:
+                        self._last_err = recorder.explain_exit(
+                            proc.poll(), list(self._stderr))
+                    return
+                buf += chunk
+            frame = np.frombuffer(bytes(buf), dtype=np.uint8).reshape(
+                self.height, self.width)
+            with self._lock:
+                if self._latest is not None:
+                    self._dropped += 1
+                self._latest = frame
+                self._frames += 1
+
+    def _drain_stderr(self) -> None:
+        """Keep FFmpeg's stderr pipe empty, and keep the last few lines.
+
+        A full stderr pipe blocks the child, which on a 70-minute trial is a
+        lost experiment; here it would merely freeze the preview, but the
+        habit is worth keeping. The retained lines are what
+        :func:`recorder.explain_exit` turns into something actionable.
+        """
+        proc = self.proc
+        if proc is None or proc.stderr is None:
+            return
+        for raw in iter(proc.stderr.readline, b""):
+            line = raw.decode("utf-8", "replace").rstrip()
+            if not line:
+                continue
+            with self._lock:
+                self._stderr.append(line)
+                del self._stderr[:-20]
+            log.debug("true preview ffmpeg: %s", line)
+
+    def stop(self) -> None:
+        self._stopping.set()
+        proc, self.proc = self.proc, None
+        if proc is None:
+            return
+        try:
+            proc.terminate()
+            try:
+                proc.wait(timeout=2.0)
+            except subprocess.TimeoutExpired:  # pragma: no cover
+                proc.kill()
+                proc.wait(timeout=2.0)
+        except OSError:  # pragma: no cover
+            pass
+        for stream in (proc.stdout, proc.stderr):
+            try:
+                if stream is not None:
+                    stream.close()
+            except OSError:  # pragma: no cover
+                pass
+        log.info("true preview stopped")
+
+    @property
+    def running(self) -> bool:
+        return self.proc is not None and self.proc.poll() is None
+
+    @property
+    def last_error(self) -> str:
+        with self._lock:
+            return self._last_err
+
+    def stderr_tail(self) -> list[str]:
+        with self._lock:
+            return list(self._stderr)
+
+    # ---- frames ----
+    def read(self) -> "np.ndarray | None":
+        """The newest frame, or None if none has arrived since the last call.
+
+        Never blocks: the reader thread owns the pipe. None is the normal
+        answer when the display timer runs faster than the pipe, and the
+        caller should simply leave the last frame on screen.
+        """
+        with self._lock:
+            frame, self._latest = self._latest, None
+        if frame is None and not self.running:
+            self._stop_threads_only()
+        return frame
+
+    #: Kept so the Acquisition tab can treat both previews alike.
+    def drain_to_latest(self, max_frames: int = 8) -> "np.ndarray | None":
+        return self.read()
+
+    def _stop_threads_only(self) -> None:
+        self._stopping.set()
+
+    @property
+    def dropped(self) -> int:
+        """Frames the display never saw because a newer one replaced them."""
+        with self._lock:
+            return self._dropped
+
+    def measured_fps(self) -> float:
+        """Frames per second arriving on the pipe.
+
+        Counted by the reader thread, so it reflects what FFmpeg is actually
+        delivering rather than how often the display happened to ask.
+        """
+        dt = time.perf_counter() - self._t0
+        with self._lock:
+            n = self._frames
+        return n / dt if dt > 0.2 else 0.0
+
+    def reset_fps_counter(self) -> None:
+        with self._lock:
+            self._frames = 0
+            self._dropped = 0
+        self._t0 = time.perf_counter()
+
+    def __enter__(self) -> "CapturePreview":
+        self.start()
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.stop()
+
+
+def flicker_from_capture(spec, cfg_paths: dict | None = None,
+                         seconds: float = 2.0, mains_hz: float = 50.0,
+                         progress=None) -> FlickerResult:
+    """Flicker test through the capture pipeline, at the capture frame rate.
+
+    Strictly better than testing through the preview, because aliasing
+    depends on the sampling rate: a 400 Hz PWM ripple sampled at 240 fps
+    folds to 160 Hz and sampled at 25 fps folds to somewhere else entirely.
+    The only rate whose verdict means anything is the one the trial will use,
+    so this runs FFmpeg undecimated for a couple of seconds and measures
+    every frame.
+    """
+    from . import ffmpeg_tools, recorder
+    ff = ffmpeg_tools.ffmpeg_path((cfg_paths or {}).get("ffmpeg", ""))
+    cmd = ([str(ff), "-hide_banner", "-loglevel", "warning", "-nostdin"]
+           + recorder.dshow_input_args(spec)
+           + ["-an", "-t", f"{seconds:.3f}",
+              "-pix_fmt", "gray", "-f", "rawvideo", "-"])
+    log.info("flicker (capture rate): %s", " ".join(cmd))
+    creation = {}
+    if paths.is_windows():  # pragma: no cover - Windows only
+        creation["creationflags"] = getattr(
+            subprocess, "CREATE_NO_WINDOW", 0x08000000)
+    need = int(spec.width) * int(spec.height)
+    means: list[float] = []
+    if progress:
+        progress(1, 2, f"sampling {seconds:.0f} s at {spec.requested_fps:g} fps…")
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE,
+                                stdin=subprocess.DEVNULL, bufsize=0, **creation)
+    except OSError as e:
+        res = FlickerResult(mains_hz=mains_hz)
+        res.level, res.verdict = "warn", f"could not start FFmpeg: {e}"
+        return res
+    try:
+        while True:
+            buf = proc.stdout.read(need) if proc.stdout else b""
+            if len(buf) < need:
+                break
+            g = np.frombuffer(buf, dtype=np.uint8)
+            means.append(float(g.mean()))
+    finally:
+        try:
+            proc.terminate()
+            proc.wait(timeout=2.0)
+        except (OSError, subprocess.TimeoutExpired):  # pragma: no cover
+            proc.kill()
+        err = (proc.stderr.read().decode("utf-8", "replace")
+               if proc.stderr else "")
+    if len(means) < 32:
+        res = FlickerResult(mains_hz=mains_hz)
+        res.frames = len(means)
+        res.level = "warn"
+        tail = [ln for ln in err.splitlines() if ln.strip()][-3:]
+        res.verdict = (f"only {len(means)} frames arrived - "
+                       + (recorder.explain_exit(proc.returncode, tail)
+                          if tail else "the camera delivered too little to judge"))
+        return res
+    if progress:
+        progress(2, 2, "computing the spectrum…")
+    # The measured rate, not the requested one: the camera negotiates.
+    return flicker_from_means(means, len(means) / seconds, mains_hz)
+
+
+def open_device_properties(spec, cfg_paths: dict | None = None) -> str:
+    """Open the camera driver's own DirectShow property page.
+
+    The authoritative way to set exposure and gain on Windows, and the only
+    way to set them *in the capture media type*: FFmpeg holds the device in
+    MJPEG at the capture frame rate while the page is up, so whatever the
+    operator sets is set against the mode the trial will use. OpenCV cannot
+    do this on this camera -- the driver refuses MJPG to it.
+
+    Returns a message for the status bar; the dialog is modal to FFmpeg, not
+    to the application, so this call returns as soon as FFmpeg is launched.
+    """
+    from . import ffmpeg_tools, recorder
+    ff = ffmpeg_tools.ffmpeg_path((cfg_paths or {}).get("ffmpeg", ""))
+    cmd = ([str(ff), "-hide_banner", "-loglevel", "error",
+            "-f", "dshow", "-show_video_device_dialog", "true"]
+           + recorder.dshow_input_args(spec)[2:]
+           + ["-t", "0.1", "-f", "null", "-"])
+    log.info("device properties: %s", " ".join(cmd))
+    try:
+        subprocess.Popen(cmd, stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError as e:
+        return f"Could not open the driver's property page: {e}"
+    return ("The camera driver's own property page is opening. Set exposure "
+            "and gain there, close it, then press Check capture to confirm "
+            "what the file looks like.")

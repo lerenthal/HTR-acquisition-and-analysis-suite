@@ -286,6 +286,28 @@ def preflight(spec: RecordingSpec, cfg_paths: dict | None = None,
 # --------------------------------------------------------------------------
 # Live statistics
 # --------------------------------------------------------------------------
+def dshow_input_args(spec: "RecordingSpec") -> list[str]:
+    """The DirectShow input half of the FFmpeg command line.
+
+    Shared by the recorder and the live preview on purpose. The preview's
+    whole value is that it shows what the recording will look like, and it
+    can only do that if it opens the camera with the same arguments -- same
+    media type, same size, same ``-framerate``, which is what fixes the
+    sensor's integration window and therefore the brightness. Two copies of
+    this list would drift, and the first symptom of the drift would be a
+    preview that lies, which is the problem it exists to solve.
+    """
+    args = ["-f", "dshow", "-rtbufsize", spec.rtbufsize,
+            "-thread_queue_size", str(max(8, int(spec.thread_queue_size))),
+            "-framerate", str(spec.requested_fps),
+            "-video_size", f"{spec.width}x{spec.height}"]
+    if spec.pixel_format in ("mjpeg", "mjpg"):
+        args += ["-vcodec", "mjpeg"]
+    else:
+        args += ["-pixel_format", spec.pixel_format]
+    return args + ["-i", f"video={spec.device_name}"]
+
+
 def explain_exit(rc: int | None, stderr_lines: list[str] | None = None) -> str:
     """Turn an FFmpeg exit status into something an operator can act on.
 
@@ -319,11 +341,18 @@ def explain_exit(rc: int | None, stderr_lines: list[str] | None = None) -> str:
                 "program and try again.")
     if "no space left" in text:
         return f"The disk filled up (exit {signed}). The recording stopped."
+    if "error opening input" in text or "unknown input format" in text:
+        return (f"FFmpeg could not open the camera (exit {signed}). "
+                + (f"It said: {stderr_lines[-1]}" if stderr_lines
+                   else "See the log for its output."))
     if signed == 0:
         return "FFmpeg finished normally."
+    # The last stderr line is almost always the useful one, and making the
+    # operator go and find the log to see it is a step for no reason.
     return (f"FFmpeg exited with {signed}"
             + (f" (reported by Windows as {rc})" if signed != rc else "")
-            + ". See the log for its output.")
+            + (f". It said: {stderr_lines[-1]}" if stderr_lines
+               else ". See the log for its output."))
 
 
 @dataclass
@@ -455,19 +484,11 @@ class Recorder:
         target = s.target_path()
         target.parent.mkdir(parents=True, exist_ok=True)
 
-        args = [str(ff), "-hide_banner", "-loglevel", "info", "-stats",
-                "-f", "dshow", "-rtbufsize", s.rtbufsize,
-                "-thread_queue_size", str(max(8, int(s.thread_queue_size))),
-                "-framerate", str(s.requested_fps),
-                "-video_size", f"{s.width}x{s.height}"]
-        if s.pixel_format in ("mjpeg", "mjpg"):
-            args += ["-vcodec", "mjpeg"]
-        else:
-            args += ["-pixel_format", s.pixel_format]
-        args += ["-i", f"video={s.device_name}",
-                 "-t", f"{s.duration_s:.3f}",
-                 # Keep the camera's own packets: no decode, no re-encode.
-                 "-c:v", "copy", "-an"]
+        args = ([str(ff), "-hide_banner", "-loglevel", "info", "-stats"]
+                + dshow_input_args(s)
+                + ["-t", f"{s.duration_s:.3f}",
+                   # Keep the camera's own packets: no decode, no re-encode.
+                   "-c:v", "copy", "-an"])
         if s.is_segmented:
             args += ["-f", "segment",
                      "-segment_time", f"{s.segment_seconds:.3f}",

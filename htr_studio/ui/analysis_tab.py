@@ -30,7 +30,7 @@ from pathlib import Path
 import numpy as np
 from PyQt5 import QtCore, QtWidgets
 
-from .. import analysis, library, paths, report, theme
+from .. import advisor, analysis, library, paths, report, theme
 from . import widgets as W
 
 log = logging.getLogger(__name__)
@@ -56,6 +56,12 @@ class AnalysisTab(QtWidgets.QWidget):
         self.ctx = ctx
         self.pal = theme.palette(ctx.cfg.get("ui.theme", "light"))
         self.worker: W.Worker | None = None
+        #: How the current settings were arrived at, written into the result
+        #: sidecar. A threshold fitted to a control animal and a band folded
+        #: for a frame rate are both decisions a reader of the numbers needs
+        #: to be able to see.
+        self._advice_provenance: dict | None = None
+        self._control_calibration: dict | None = None
         self.run_job = W.JobRunner("analysis", self)
         self.run_job.progressed.connect(self._on_progress)
         self.run_job.finished.connect(self._on_done)
@@ -423,7 +429,10 @@ class AnalysisTab(QtWidgets.QWidget):
         self.btn_run = W.button("Run analysis", "primary")
         self.btn_cancel = W.button("Cancel")
         self.btn_cancel.setEnabled(False)
-        self.btn_defaults = W.button("Reset to defaults")
+        self.btn_defaults = W.button(
+            "Reset to defaults",
+            tooltip="Restores every analysis setting to the values the code "
+                    "ships with. Lists what will change and asks first.")
         self.btn_validate = W.button(
             "Validate against ground truth…",
             tooltip="Scores the current settings against a CSV of known twitch "
@@ -432,6 +441,51 @@ class AnalysisTab(QtWidgets.QWidget):
             row.addWidget(b)
         row.addStretch(1)
         v.addLayout(row)
+
+        row2 = QtWidgets.QHBoxLayout()
+        self.btn_suggest = W.button(
+            "Suggest settings for this file…",
+            tooltip="Reads the recording's resolution and true frame rate, "
+                    "calibrates on a sample of its frames, and lists the "
+                    "settings that do not suit it - with the reasoning for "
+                    "each. Nothing changes until you press Apply.\n\n"
+                    "The frame rate is the setting everything else hangs "
+                    "off: below about 200 fps the 78-98 Hz twitch is above "
+                    "Nyquist and folds down to a lower frequency, so the "
+                    "band-pass has to move to where the signal actually "
+                    "lands rather than where the twitch really is.")
+        self.btn_control = W.button(
+            "Calibrate from a control video…",
+            tooltip="Fits the detection threshold to an untreated recording, "
+                    "where every call is a false positive by construction. "
+                    "Sweeps the threshold, shows the false-positive curve, "
+                    "and picks one step below the point at which the control "
+                    "falls silent.\n\n"
+                    "Run this once per session on a vehicle animal, then "
+                    "apply it to that session's treated recordings - it is "
+                    "fitted to one lighting, exposure, zoom and arena.")
+        self.cb_profile = QtWidgets.QComboBox()
+        self.cb_profile.setToolTip(
+            "Session profiles saved from a control-video calibration. Each "
+            "one carries the control file, the sweep and the margin it was "
+            "fitted with, so a count can be traced back to how its "
+            "threshold was arrived at.")
+        self.btn_profile_apply = W.button("Apply profile")
+        self.btn_profile_apply.setEnabled(False)
+        row2.addWidget(self.btn_suggest)
+        row2.addWidget(self.btn_control)
+        row2.addStretch(1)
+        row2.addWidget(QtWidgets.QLabel("Session profile:"))
+        row2.addWidget(self.cb_profile)
+        row2.addWidget(self.btn_profile_apply)
+        v.addLayout(row2)
+        self.btn_suggest.clicked.connect(self._suggest_settings)
+        self.btn_control.clicked.connect(self._calibrate_control)
+        self.btn_profile_apply.clicked.connect(self._apply_profile)
+        self.cb_profile.currentIndexChanged.connect(
+            lambda i: self.btn_profile_apply.setEnabled(
+                self.cb_profile.itemData(i) is not None))
+        self._refresh_profiles()
         self.progress = QtWidgets.QProgressBar()
         v.addWidget(self.progress)
         self.lbl_run = W.StatusLabel("Pick a recording in the Library, then press "
@@ -482,7 +536,17 @@ class AnalysisTab(QtWidgets.QWidget):
     # Config binding
     # ------------------------------------------------------------------
     def _load(self) -> None:
-        a = analysis.AnalysisConfig.from_dict(self.ctx.cfg.section("analysis"))
+        self.apply_config(
+            analysis.AnalysisConfig.from_dict(self.ctx.cfg.section("analysis")))
+
+    def apply_config(self, a: analysis.AnalysisConfig) -> None:
+        """Push a config into the widgets.
+
+        The inverse of :meth:`current_config`, and the single way anything
+        sets these controls -- stored settings, the shipped defaults, the
+        per-file advisor and a session profile all come through here, so a
+        control added later is handled by all four at once.
+        """
         self._set_combo(self.cb_angle, a.angle_source)
         self.cb_seg.setCurrentText(a.segmentation)
         self.cb_polarity.setCurrentText(a.polarity)
@@ -566,9 +630,38 @@ class AnalysisTab(QtWidgets.QWidget):
         self.ctx.cfg.data["analysis"] = self.current_config().to_dict()
 
     def _reset_defaults(self) -> None:
-        self.ctx.cfg.reset_section("analysis")
-        self._load()
-        self.lbl_run.set("Parameters reset to the shipped defaults.", "ok")
+        """Back to the dataclass defaults, with a confirm step.
+
+        Reset from :class:`analysis.AnalysisConfig` itself rather than from
+        the stored settings file, so "defaults" means the values the code
+        ships with even if the stored section has been edited by hand or
+        written by an older version. The confirm is there because a reset
+        discards a threshold that may have taken a control-video sweep to
+        arrive at.
+        """
+        cur = self.current_config()
+        shipped = analysis.AnalysisConfig()
+        changed = [f for f in shipped.__dataclass_fields__
+                   if getattr(cur, f) != getattr(shipped, f)]
+        if not changed:
+            self.lbl_run.set("Already at the shipped defaults - "
+                             "nothing to reset.", "info")
+            return
+        if not W.ask_yes_no(
+                self, "Reset analysis settings",
+                f"{len(changed)} setting(s) differ from the shipped defaults "
+                "and will be restored:<br><br><tt>"
+                + ", ".join(sorted(changed))
+                + "</tt><br><br>If any of these came from a control-video "
+                  "calibration, save that as a session profile first or it "
+                  "will have to be measured again."):
+            return
+        self.apply_config(shipped)
+        self.ctx.cfg.data["analysis"] = shipped.to_dict()
+        self.lbl_run.set(
+            f"Reset {len(changed)} setting(s) to the shipped defaults: "
+            + ", ".join(sorted(changed)), "ok")
+        log.info("analysis settings reset to defaults: %s", ", ".join(changed))
 
     # ------------------------------------------------------------------
     # Target selection
@@ -583,6 +676,11 @@ class AnalysisTab(QtWidgets.QWidget):
         self.sp_rate_override.blockSignals(False)
         self.lbl_rate_note.setVisible(False)
         self.btn_spectrum.setEnabled(False)
+        # Per-file advice belongs to the file it was measured on, so it is
+        # cleared here. A session calibration deliberately is not: it is
+        # fitted once per session and applied across that session's
+        # recordings, which is the whole point of it.
+        self._advice_provenance = None
         fps = entry.fps_for_analysis()
         self.lbl_target.setText(
             f"<b>{entry.name}</b><br>{entry.path}<br>"
@@ -672,6 +770,95 @@ class AnalysisTab(QtWidgets.QWidget):
                          self.pal, self)
         dlg.configChanged.connect(self._adopt_tracking)
         dlg.exec_()
+
+    # ------------------------------------------------------------------
+    # Settings advice and session calibration
+    # ------------------------------------------------------------------
+    def _suggest_settings(self) -> None:
+        entry = self.ctx.entry
+        if entry is None:
+            W.warn_box(self, "No recording selected",
+                       "Select a recording in the Library, or use 'Open a "
+                       "video file' here, so there is something to inspect.")
+            return
+        from .advisor_dialog import SuggestDialog
+        dlg = SuggestDialog(self.ctx, entry.analysis_target,
+                            self.current_config(), self)
+        if dlg.exec_() == QtWidgets.QDialog.Accepted and dlg.result_cfg:
+            self.apply_config(dlg.result_cfg)
+            # Keep the reasoning: it goes into the result sidecar, so the
+            # settings a figure was produced under carry their justification.
+            self._advice_provenance = (dlg.advice.provenance()
+                                       if dlg.advice else None)
+            n = len(dlg.advice.pending) if dlg.advice else 0
+            self.lbl_run.set(
+                f"Applied {n} suggested setting(s) for this recording. Run "
+                "the analysis to use them; the reasoning is saved with the "
+                "result.", "warn")
+
+    def _calibrate_control(self) -> None:
+        entry = self.ctx.entry
+        if entry is None:
+            W.warn_box(self, "No recording selected",
+                       "Select the untreated control recording in the "
+                       "Library first - the calibration is fitted to it.")
+            return
+        if not W.ask_yes_no(
+                self, "Is this the control recording?",
+                f"<b>{entry.path.name}</b><br><br>"
+                "This fits the detection threshold on the assumption that "
+                "the animal in this recording received no drug, so that "
+                "every burst found in it is a false positive.<br><br>"
+                "Running it on a treated recording would tune the threshold "
+                "until the real twitches disappeared. Is this the control?"):
+            return
+        from .advisor_dialog import ControlCalibrationDialog
+        dlg = ControlCalibrationDialog(
+            self.ctx, entry.analysis_target, self.current_config(),
+            fps_override=float(self.sp_rate_override.value()), parent=self)
+        if dlg.exec_() == QtWidgets.QDialog.Accepted and dlg.result_cfg:
+            self.apply_config(dlg.result_cfg)
+            self._control_calibration = (dlg.cal.to_dict() if dlg.cal else None)
+            self.lbl_run.set(
+                f"Threshold set from the control recording: k = "
+                f"{dlg.result_cfg.threshold_k:g}. Apply this to the treated "
+                "recordings of the same session only.", "warn")
+        self._refresh_profiles()
+
+    def _refresh_profiles(self) -> None:
+        self.cb_profile.blockSignals(True)
+        self.cb_profile.clear()
+        self.cb_profile.addItem("(none)", None)
+        for doc in advisor.list_profiles():
+            cal = doc.get("control_calibration") or {}
+            k = (doc.get("config") or {}).get("threshold_k")
+            label = str(doc.get("name") or Path(doc["path"]).stem)
+            if k is not None:
+                label += f"  (k={float(k):g})"
+            self.cb_profile.addItem(label, doc["path"])
+            self.cb_profile.setItemData(
+                self.cb_profile.count() - 1,
+                (cal.get("message") or "no calibration recorded"),
+                QtCore.Qt.ToolTipRole)
+        self.cb_profile.blockSignals(False)
+        self.btn_profile_apply.setEnabled(False)
+
+    def _apply_profile(self) -> None:
+        path = self.cb_profile.currentData()
+        if not path:
+            return
+        try:
+            doc = advisor.load_profile(path)
+        except (OSError, ValueError) as e:
+            W.warn_box(self, "Could not read the profile", str(e))
+            return
+        cfg = analysis.AnalysisConfig.from_dict(doc.get("config") or {})
+        self.apply_config(cfg)
+        self._control_calibration = doc.get("control_calibration")
+        cal = doc.get("control_calibration") or {}
+        self.lbl_run.set(
+            f"Applied the session profile '{doc.get('name', '')}'. "
+            + (cal.get("message") or ""), "warn")
 
     def _adopt_tracking(self, fields: dict) -> None:
         self.cb_seg.setCurrentText(fields["segmentation"])
@@ -1027,6 +1214,13 @@ class AnalysisTab(QtWidgets.QWidget):
             "bins": bins,
             "n_accepted": det.count,
             "curated": False,
+            # How these settings were arrived at. Without this a sidecar
+            # records a threshold of 4.5 and a band of 17-47 Hz with no way
+            # to tell whether either was deliberate.
+            "settings_provenance": {
+                "file_advice": self._advice_provenance,
+                "control_calibration": self._control_calibration,
+            } if (self._advice_provenance or self._control_calibration) else None,
         }
         try:
             p = library.save_analysis(entry, doc)

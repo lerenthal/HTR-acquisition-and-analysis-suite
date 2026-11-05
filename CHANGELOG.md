@@ -1,5 +1,133 @@
 # Changelog
 
+## 1.3.0-dev
+
+### The preview now shows what will be recorded
+
+The old preview was OpenCV, and on Windows the DirectShow backend negotiates on
+OpenCV's behalf: ask the B0634 for MJPG and the driver returns YUY2, and
+`CAP_PROP_FPS` echoes the request rather than reporting what was agreed.
+FFmpeg, asked for `-vcodec mjpeg -framerate 200`, gets exactly that. Two
+different media types at two different frame rates have two different exposure
+windows — and since brightness follows integration time, the preview could be
+several times brighter than the file. An operator setting lighting against it
+was setting it against the wrong picture.
+
+* **`camera.CapturePreview`** opens the camera through FFmpeg with
+  `recorder.dshow_input_args(spec)` — the same argument list the recording
+  uses, not a copy of it, so the two cannot drift. It is the default; the
+  OpenCV preview remains as "Fast" for framing and focus.
+* A reader thread owns the pipe and holds only the newest frame. A pipe read
+  blocks until a whole frame arrives, and doing that on the GUI thread cost a
+  measured 89 ms per tick. Steady-state ticks are now **under 1 ms median**,
+  with one ~30 ms tick when the first frame arrives (Qt and OpenCV lazy
+  initialisation at the frame's size).
+* FFmpeg cannot set UVC controls, so a control change closes the device, sets
+  it, and reopens — about a second. A slider drag emits one change per pixel of
+  travel, so a debounce timer collapses a drag into **one** reopen.
+* **Camera properties…** opens the driver's own DirectShow property page while
+  FFmpeg holds the device in the capture mode. On this camera that is the only
+  way to set exposure and gain in the mode the trial will use.
+* The **flicker test** now runs through the capture pipeline at the capture
+  frame rate. Whether a PWM ripple folds into the 55–125 Hz band depends on the
+  sampling rate, so a verdict taken at the preview's rate said nothing about a
+  200 fps recording.
+* The lighting readouts are recomputed 4×/s rather than every frame: measured at
+  3.8 ms (QVGA) and 14.5 ms (VGA) per call, nearly all of it the Laplacian
+  variance behind the focus score.
+
+### The analysis settings advisor
+
+`htr_studio/advisor.py`. The shipped defaults can only be right for one kind of
+file; point the tool at a 120 fps published clip and several are not merely
+suboptimal but wrong.
+
+* **`suggest_settings`** reads the container and calibrates on a frame sample,
+  then lists what to change *with the arithmetic for each*. Nothing is applied
+  until Apply is pressed, and the reasons go into the result sidecar under
+  `settings_provenance`.
+* **The band-pass band is the setting everything hangs off.** Above Nyquist the
+  78–98 Hz twitch folds rather than vanishing: at 120 fps it lands at 22–42 Hz,
+  so the default 60–110 Hz band filters empty spectrum. Measured on the paper
+  footage: `example_vid3_LSD` went from **0 detections to 10**, and
+  `example_vid1_DOI` from **0 to 6**, same frames, same threshold rule.
+* Folding is computed over the whole band, not its endpoints, because it
+  reflects at every multiple of `fps/2`: 100–140 Hz at 120 fps folds to 0–20 Hz
+  while both endpoints land on 20. Endpoint arithmetic would have proposed a
+  band containing almost none of the signal.
+* A folded band reaching below 15 Hz is flagged as **bad**, not merely
+  suggested: there it overlaps locomotion and grooming, and no threshold will
+  separate them.
+* The 240 fps benchmark is unaffected — the advisor proposes only cosmetic
+  changes there and **F1 stays 1.000** with and without them.
+
+### Calibrating a session from an untreated control
+
+An untreated animal should produce no head twitches, so every burst found in a
+vehicle recording is a false positive by construction. Sweeping the threshold
+over it measures the rig's own noise floor.
+
+* **`calibrate_from_control`** sweeps `threshold_k`, plots the false-positive
+  curve, and picks **one step below** the lowest setting at which the control
+  falls silent. Sitting exactly at the silent point means tuning until the
+  detector can just barely not see the loudest non-twitch present, which is a
+  hair from not seeing a real twitch either.
+* It reports the margin between the chosen threshold and the tallest control
+  peak, and **refuses to invent a number when there isn't one**. Run on
+  `example_vid2_noI`, it reported 4 calls remaining at k = 12 and said so:
+  *"That is not a threshold problem: something in this footage is producing
+  movement in the detection band."*
+* Results save as named **session profiles** carrying the control file, the
+  sweep and the margin, so a count can be traced to how its threshold was
+  fitted.
+
+### Four defects found by the operator
+
+* **Every integer slider was dead on drag.** `raw / self._scale` is a float even
+  when the scale is 1 (`240 / 1 == 240.0`), and `QSpinBox.setValue` refuses a
+  float; the `TypeError` aborted the handler before the value was pushed to the
+  camera. Exposure, gain, brightness, contrast and gamma could only be set by
+  typing.
+* **Review kept the previous file's burst regions.** `AppContext.entryChanged`
+  existed and nothing was connected to it, so each open path told the tabs by
+  hand and "Open in Analysis" forgot Review. `set_entry` is now the only writer
+  of `ctx.entry` and both tabs subscribe.
+* **"Finished: 13,260 frames, 0 B"** — the segment muxer reports no size on
+  FFmpeg's stats line, and the folder-size fallback sat inside the
+  still-running branch, so it ran during the recording but not for the summary.
+* **`ffmpeg exited with code 4294967291`** was `-video_size 320x245` from the
+  mouse wheel passing over an unfocused spin box. Wheel events are now ignored
+  on unfocused spin and combo boxes (61 widgets), the exit code is translated
+  into plain language, and pre-flight rejects a capture size that is not a
+  multiple of 8.
+
+### A settings default that had drifted, and did not reach the rig
+
+`config.DEFAULTS["analysis"]` was a hand-written copy of
+`analysis.AnalysisConfig`'s field defaults, and it had drifted: it still carried
+`max_area_frac: 0.45` after the dataclass was lowered to **0.25** — 0.45 being
+the ceiling that let the lit arena floor (33 % of frame, perfectly stable) be
+accepted as the animal. Eight other fields were simply absent. Since a stored
+value wins over a default, a rig that already had a `settings.json` kept 0.45
+and the arena-floor fix was never actually active there; "Reset to defaults"
+restored the broken value.
+
+* `DEFAULTS["analysis"]` is now **derived from the dataclass**, so there is one
+  place a default lives.
+* A **schema migration** (version 3) corrects a stored 0.45 ceiling and a stored
+  fixed 9 px tail kernel, matching on the exact old default so a deliberately
+  chosen value is kept.
+* **Reset to defaults** now resets from the dataclass, lists what will change,
+  and asks first.
+
+### Tests
+
+`tools/regress_1_2_2.py`, `tools/test_true_preview.py`, `tools/test_advisor.py`
+and `tools/test_advisor_ui.py` — 100 checks. The preview and dialog tests drive
+the real widgets with stand-in cameras and footage, which is the generalisation
+of the `%LOCALAPPDATA%` lesson: a path that only runs on Windows with hardware
+attached is untested by construction.
+
 ## 1.1.0
 
 Three problems reported from real use, with what was measured in each case.

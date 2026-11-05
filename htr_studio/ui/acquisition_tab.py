@@ -165,6 +165,12 @@ class AcquisitionTab(QtWidgets.QWidget):
         self.check_job = W.JobRunner("capture-check", self)
         self.check_job.finished.connect(self._check_capture_done)
         self.check_job.failed.connect(self._job_failed)
+        self._flicker_was_previewing = False
+        self._metrics_at = 0.0
+        self.flicker_job = W.JobRunner("flicker", self)
+        self.flicker_job.finished.connect(self._flicker_done)
+        self.flicker_job.failed.connect(
+            lambda m, tb: self.lbl_flicker.set(f"Flicker test failed: {m}", "bad"))
 
         self._build()
         W.no_wheel(self)
@@ -177,6 +183,16 @@ class AcquisitionTab(QtWidgets.QWidget):
         self.rec_timer = QtCore.QTimer(self)
         self.rec_timer.setInterval(500)
         self.rec_timer.timeout.connect(self._tick_recording)
+
+        # Coalesces a slider drag into a single reopen of the true preview.
+        # A drag emits a change per pixel of travel and each reopen costs
+        # about a second, so without this a drag across the track would queue
+        # dozens of them.
+        self._reopen_timer = QtCore.QTimer(self)
+        self._reopen_timer.setSingleShot(True)
+        self._reopen_timer.setInterval(
+            int(self.ctx.cfg.get("camera.preview_reopen_debounce_ms", 500)))
+        self._reopen_timer.timeout.connect(self._reopen_true_preview)
 
         QtCore.QTimer.singleShot(0, self.refresh_devices)
 
@@ -346,7 +362,12 @@ class AcquisitionTab(QtWidgets.QWidget):
             "Run flicker test (2 s)",
             tooltip="Looks for brightness ripple from PWM-dimmed lighting. "
                     "Ripple in the 55-125 Hz band produces whole-field false "
-                    "positives that cannot be fixed in analysis.")
+                    "positives that cannot be fixed in analysis.\n\n"
+                    "Measured through the capture pipeline at the capture "
+                    "frame rate, because whether a ripple folds into the HTR "
+                    "band depends on the sampling rate. The preview stops for "
+                    "the two seconds it takes and comes back afterwards.")
+        self.flicker_job._button = self.btn_flicker
         row.addWidget(self.btn_flicker)
         row.addStretch(1)
         v.addLayout(row)
@@ -372,9 +393,33 @@ class AcquisitionTab(QtWidgets.QWidget):
         v = QtWidgets.QVBoxLayout(g)
 
         row = QtWidgets.QHBoxLayout()
+        self.cb_preview_mode = QtWidgets.QComboBox()
+        self.cb_preview_mode.addItem("True (capture pipeline)", "capture")
+        self.cb_preview_mode.addItem("Fast (OpenCV)", "opencv")
+        self.cb_preview_mode.setToolTip(
+            "<b>True</b> opens the camera with the recorder's own FFmpeg "
+            "arguments - the same media type, size and frame rate - so the "
+            "picture is the one that will be written to disk, with the same "
+            "exposure window. FFmpeg holds the device while it runs, so "
+            "changing a control reopens the preview (about a second), and "
+            "exposure and gain are set through 'Camera properties'.<br><br>"
+            "<b>Fast</b> is the OpenCV preview: controls respond instantly "
+            "and there is no blink, but on this camera the driver refuses "
+            "MJPG to OpenCV and falls back to YUY2 at a different frame "
+            "rate, so the brightness is not the recording's. Use it for "
+            "framing and focus, which it shows perfectly well.")
+        row.addWidget(QtWidgets.QLabel("Preview:"))
+        row.addWidget(self.cb_preview_mode)
         self.btn_preview = W.button("Start preview", "primary")
         self.btn_snapshot = W.button("Save snapshot")
         self.btn_snapshot.setEnabled(False)
+        self.btn_props = W.button("Camera properties…")
+        self.btn_props.setToolTip(
+            "Opens the camera driver's own DirectShow property page while "
+            "FFmpeg holds the device in the capture mode, so exposure and "
+            "gain are set against the mode the trial will actually use. On "
+            "this camera that is the only way to do it: OpenCV cannot get "
+            "the MJPEG mode from the driver at all.")
         self.btn_check_capture = W.button("Check capture")
         self.check_job._button = self.btn_check_capture
         self.btn_check_capture.setToolTip(
@@ -391,6 +436,7 @@ class AcquisitionTab(QtWidgets.QWidget):
             "analysis sees, so the file is what to judge.")
         row.addWidget(self.btn_preview)
         row.addWidget(self.btn_snapshot)
+        row.addWidget(self.btn_props)
         row.addWidget(self.btn_check_capture)
         row.addStretch(1)
         self.lbl_negotiated = QtWidgets.QLabel("")
@@ -431,7 +477,9 @@ class AcquisitionTab(QtWidgets.QWidget):
 
         self.btn_preview.clicked.connect(self._toggle_preview)
         self.btn_snapshot.clicked.connect(self._snapshot)
+        self.btn_props.clicked.connect(self._open_properties)
         self.btn_check_capture.clicked.connect(self._check_capture)
+        self.cb_preview_mode.currentIndexChanged.connect(self._preview_mode_changed)
         return g
 
     # ---- trial metadata ----
@@ -567,6 +615,11 @@ class AcquisitionTab(QtWidgets.QWidget):
         self.sl_contrast.set_value(float(c.get("camera.contrast", 32) or 32))
         self.sl_gamma.set_value(float(c.get("camera.gamma", 100) or 100))
 
+        pm = self.cb_preview_mode.findData(str(c.get("camera.preview_mode", "capture")))
+        self.cb_preview_mode.blockSignals(True)
+        self.cb_preview_mode.setCurrentIndex(max(0, pm))
+        self.cb_preview_mode.blockSignals(False)
+
         self.sp_total.setValue(float(c.get("recording.total_seconds", 4200)) / 60.0)
         self.sp_baseline.setValue(float(c.get("recording.baseline_seconds", 600)) / 60.0)
         seg = float(c.get("recording.segment_seconds", 300)) / 60.0
@@ -588,6 +641,7 @@ class AcquisitionTab(QtWidgets.QWidget):
         c.set("camera.brightness", self.sl_brightness.value())
         c.set("camera.contrast", self.sl_contrast.value())
         c.set("camera.gamma", self.sl_gamma.value())
+        c.set("camera.preview_mode", self.cb_preview_mode.currentData() or "capture")
         if self.cb_device.currentText():
             c.set("camera.device_name", self.cb_device.currentText())
         data = self.cb_index.currentData()
@@ -837,12 +891,92 @@ class AcquisitionTab(QtWidgets.QWidget):
         else:
             self._start_preview()
 
+    @property
+    def _true_preview(self) -> bool:
+        return self.cb_preview_mode.currentData() == "capture"
+
     def _start_preview(self) -> None:
         if self.rec is not None and self.rec.running:
             W.warn_box(self, "Recording in progress",
                        "The camera is busy recording. Stop the recording first - a "
                        "DirectShow device only admits one client at a time.")
             return
+        self._warm_up()
+        if self._true_preview:
+            self._start_true_preview()
+        else:
+            self._start_opencv_preview()
+
+    #: Frame shapes already warmed, so the cost is paid once per mode.
+    _warmed: set = set()
+
+    def _warm_up(self) -> None:
+        """Pay OpenCV's and Qt's first-call costs before the camera is live.
+
+        Measured: the first ``frame_metrics`` call costs 17 ms against 3 ms
+        thereafter, and the first ``show_frame`` 21 ms against 1.2 ms -- 37 ms
+        of lazy initialisation inside OpenCV and Qt's pixmap path. Left
+        alone, all of it lands on the first preview frame, which is precisely
+        the moment the operator is watching, and it showed up as a 46 ms tick
+        in the latency test.
+
+        At the *frame's own size*, not a token 16x16 one: warming a tiny
+        array was tried and did nothing, because OpenCV allocates its
+        scratch buffers per shape. So the warm-up has to use the shape the
+        preview will deliver, which is the configured capture size.
+        """
+        try:
+            w, h, _fps, _pf = self._current_mode()
+            key = (int(h), int(w))
+            if key in AcquisitionTab._warmed or min(key) <= 0:
+                return
+            AcquisitionTab._warmed.add(key)
+            # Not zeros: an all-zero frame short-circuits some of the work.
+            blank = np.full(key, 128, dtype=np.uint8)
+            blank[:: max(1, key[0] // 8)] = 60
+            camera.frame_metrics(blank)
+            self.view.show_frame(blank, {"crosshair": True}, "")
+            self.view.setText("")
+        except Exception:  # pragma: no cover - warm-up must never block a trial
+            log.debug("preview warm-up failed", exc_info=True)
+
+    def _start_true_preview(self) -> None:
+        """Preview through the capture pipeline, so it shows the real thing."""
+        if not self.cb_device.currentText():
+            W.warn_box(self, "No device",
+                       "Pick a DirectShow device first - the true preview opens "
+                       "the camera the same way the recording does, by name.")
+            return
+        try:
+            spec = self._spec()
+        except Exception as e:  # pragma: no cover - during construction
+            W.warn_box(self, "Could not build the capture settings", str(e))
+            return
+        self.preview = camera.CapturePreview(
+            spec, dict(self.ctx.cfg.get("paths", {}) or {}),
+            display_fps=float(self.ctx.cfg.get("camera.preview_display_fps", 25)))
+        if not self.preview.start():
+            W.warn_box(self, "Could not start the true preview",
+                       self.preview.last_error)
+            self.preview = None
+            return
+        self.lbl_negotiated.setText(
+            f"capture pipeline: {spec.width}x{spec.height} @ "
+            f"{spec.requested_fps:g} {spec.pixel_format}")
+        self.lbl_mode_warning.set(
+            "True preview: this is the capture pipeline, so what you see is "
+            "what will be recorded - same mode, frame rate and exposure "
+            "window. FFmpeg holds the camera, so a control change reopens it "
+            "(about a second). Use 'Camera properties' to set exposure and "
+            "gain in the driver's own page, which is the only way to set them "
+            "in the capture mode on this camera.", "info")
+        self.lbl_mode_warning.setVisible(True)
+        self.btn_preview.setText("Stop preview")
+        self.btn_snapshot.setEnabled(True)
+        self.preview_timer.start()
+        self.statusMessage.emit("True preview running (capture pipeline)")
+
+    def _start_opencv_preview(self) -> None:
         data = self.cb_index.currentData()
         if data is None:
             W.warn_box(self, "No preview device",
@@ -864,23 +998,101 @@ class AcquisitionTab(QtWidgets.QWidget):
         self.btn_preview.setText("Stop preview")
         self.btn_snapshot.setEnabled(True)
         self.preview_timer.start()
-        self.statusMessage.emit("Preview running")
+        self.statusMessage.emit("Fast preview running (OpenCV)")
 
     def _stop_preview(self) -> None:
         self.preview_timer.stop()
+        self._reopen_timer.stop()
         if self.preview is not None:
             self.preview.stop()
             self.preview = None
+        # Reset, so the next start shows "waiting for the first frame" rather
+        # than the previous session's numbers beside a blank pane. The spec
+        # written into a sidecar reads these, so stale ones would be recorded
+        # as this trial's lighting.
+        self._last_metrics = None
+        self._metrics_at = 0.0
+        for t in (self.t_fps, self.t_mean, self.t_contrast, self.t_clip,
+                  self.t_focus, self.t_uniform):
+            t.set_value("-")
         self.btn_preview.setText("Start preview")
         self.btn_snapshot.setEnabled(False)
         self.statusMessage.emit("Preview stopped")
 
-    def _push_controls(self, *_args) -> None:
+    def _preview_mode_changed(self, *_args) -> None:
+        """Switching mode restarts a running preview, and nothing else."""
         if self.preview is not None and self.preview.running:
-            applied = self.preview.push(self._uvc())
-            if applied.warnings:
-                self.lbl_negotiated.setText(" | ".join(applied.warnings)[:120])
-            self._warn_mode_mismatch(applied)
+            self._stop_preview()
+            self._start_preview()
+        else:
+            self.lbl_mode_warning.setVisible(False)
+
+    def _open_properties(self) -> None:
+        if self.rec is not None and self.rec.running:
+            W.warn_box(self, "Recording in progress",
+                       "Stop the recording before opening the driver's page.")
+            return
+        if not self.cb_device.currentText():
+            W.warn_box(self, "No device", "Pick a DirectShow device first.")
+            return
+        # The page belongs to the capture filter, so the device has to be free.
+        was_running = self.preview is not None and self.preview.running
+        if was_running:
+            self._stop_preview()
+        msg = camera.open_device_properties(
+            self._spec(), dict(self.ctx.cfg.get("paths", {}) or {}))
+        self.lbl_mode_warning.set(msg, "info")
+        self.lbl_mode_warning.setVisible(True)
+        self.statusMessage.emit(msg)
+        if was_running:
+            W.info_box(self, "Preview stopped",
+                       "The preview was stopped so the driver's property page "
+                       "could take the camera. Start it again when you have "
+                       "closed the page.")
+
+    def _push_controls(self, *_args) -> None:
+        """A control changed. How that is applied depends on the preview.
+
+        The fast OpenCV preview owns the handle, so a control can be pushed
+        into it and the effect is immediate. The true preview is FFmpeg
+        holding the device, and FFmpeg cannot set UVC controls, so the only
+        way to apply one is to close the device, set it through a brief
+        OpenCV handle, and reopen - about a second. A slider drag emits one
+        change per pixel of travel, so that cannot happen per emission: the
+        timer coalesces a drag into one reopen after the operator lets go.
+        """
+        if self.preview is None or not self.preview.running:
+            return
+        if self._true_preview:
+            self._reopen_timer.start()
+            return
+        applied = self.preview.push(self._uvc())
+        if applied.warnings:
+            self.lbl_negotiated.setText(" | ".join(applied.warnings)[:120])
+        self._warn_mode_mismatch(applied)
+
+    def _reopen_true_preview(self) -> None:
+        """Apply the pending control change and bring the preview back."""
+        if self.preview is None or not self._true_preview:
+            return
+        self.preview_timer.stop()
+        self.preview.stop()
+        idx = self.cb_index.currentData()
+        if idx is not None and self.ctx.cfg.get("camera.apply_uvc_before_record", True):
+            st = camera.apply_uvc_oneshot(
+                int(idx), self._uvc(),
+                self.ctx.cfg.get("camera.opencv_backend", "dshow"))
+            for wmsg in st.warnings:
+                log.info("true preview control push: %s", wmsg)
+        if not self.preview.start():
+            self.lbl_mode_warning.set(
+                "Could not reopen the preview: " + self.preview.last_error, "bad")
+            self.lbl_mode_warning.setVisible(True)
+            self.btn_preview.setText("Start preview")
+            self.btn_snapshot.setEnabled(False)
+            self.preview = None
+            return
+        self.preview_timer.start()
 
     def _warn_mode_mismatch(self, applied) -> None:
         """Say, in the window, when the preview cannot represent the capture.
@@ -977,33 +1189,67 @@ class AcquisitionTab(QtWidgets.QWidget):
         one never comes close. Rather than guess, measure and back off, and
         recover when it gets cheap again.
         """
-        if self.preview is None or not self.preview.running:
+        if self.preview is None:
+            return
+        if not self.preview.running:
+            # Do not just return. The camera being unplugged, or FFmpeg being
+            # killed, leaves a stopped preview and a frozen last frame, and
+            # bailing out here would show that stale frame indefinitely with
+            # no indication anything was wrong. Say what happened and tidy up.
+            err = self.preview.last_error or "the camera stopped delivering frames"
+            self.lbl_mode_warning.set(f"Preview stopped: {err}", "bad")
+            self.lbl_mode_warning.setVisible(True)
+            log.warning("preview stopped: %s", err)
+            self._stop_preview()
             return
         t_start = time.perf_counter()
         gray = self.preview.read()
         if gray is None:
+            if self._last_metrics is None:
+                # Opening a DirectShow graph takes about a second, so the
+                # first frame is not instant. Say so, rather than leaving a
+                # blank pane that looks like a failure.
+                self.view.setText("waiting for the first frame from the camera…")
             return
-        m = camera.frame_metrics(gray)
-        self._last_metrics = m
+
+        # Drawing is cheap (1 ms at QVGA, 0.3 at VGA); the metrics are not --
+        # measured at 3.8 ms for QVGA and 14.5 ms for VGA, nearly all of it
+        # the Laplacian variance behind the focus score. Recomputing those at
+        # the display rate would spend 36% of the event loop at VGA on
+        # numbers nobody can read changing 25 times a second. So the picture
+        # updates every tick and the readouts a few times a second.
         self.view.show_frame(gray, {"crosshair": True},
                              caption=f"{gray.shape[1]}x{gray.shape[0]}")
         self.t_fps.set_value(f"{self.preview.measured_fps():.0f}")
-        self.t_mean.set_value(f"{m.mean:.0f}")
-        self.t_contrast.set_value(f"{m.contrast:.0f}")
-        self.t_clip.set_value(f"{m.clipped_high_pct:.1f}")
-        self.t_focus.set_value(f"{m.focus_score:.0f}")
-        self.t_uniform.set_value(f"{m.uniformity:.2f}")
-        self._draw_histogram(m)
-        for i, lbl in enumerate(self.verdict_labels):
-            if i < len(m.verdicts):
-                level, text = m.verdicts[i]
-                lbl.set(text, level)
-            else:
-                lbl.set("", "info")
+
+        now = time.perf_counter()
+        due = (self._last_metrics is None
+               or (now - self._metrics_at) * 1000.0 >= self.METRICS_INTERVAL_MS)
+        if due:
+            self._metrics_at = now
+            m = camera.frame_metrics(gray)
+            self._last_metrics = m
+            self.t_mean.set_value(f"{m.mean:.0f}")
+            self.t_contrast.set_value(f"{m.contrast:.0f}")
+            self.t_clip.set_value(f"{m.clipped_high_pct:.1f}")
+            self.t_focus.set_value(f"{m.focus_score:.0f}")
+            self.t_uniform.set_value(f"{m.uniformity:.2f}")
+            self._draw_histogram(m)
+            for i, lbl in enumerate(self.verdict_labels):
+                if i < len(m.verdicts):
+                    level, text = m.verdicts[i]
+                    lbl.set(text, level)
+                else:
+                    lbl.set("", "info")
         self._pace_preview((time.perf_counter() - t_start) * 1000.0)
 
     #: Never let the preview consume more than this share of the event loop.
     PREVIEW_DUTY = 0.5
+
+    #: How often the lighting readouts are recomputed. They are judgement
+    #: aids for a human setting up a rig, not a signal, and four times a
+    #: second is already faster than anyone can read them.
+    METRICS_INTERVAL_MS = 250.0
 
     def _pace_preview(self, cost_ms: float) -> None:
         """Keep the preview below PREVIEW_DUTY of the event loop's time."""
@@ -1101,16 +1347,39 @@ class AcquisitionTab(QtWidgets.QWidget):
             ln.replace("<b>", "").replace("</b>", "") for ln in lines))
 
     def _flicker(self) -> None:
-        if self.preview is None or not self.preview.running:
-            self.lbl_flicker.set("Start the preview first.", "warn")
+        """Measure light ripple at the capture frame rate.
+
+        Not at the preview's rate. Whether a PWM ripple lands in the
+        55-125 Hz band depends on the sampling rate -- a 400 Hz ripple folds
+        to 160 Hz at 240 fps and somewhere else entirely at 25 -- so the only
+        verdict worth having is the one taken at the rate the trial will run.
+        That means FFmpeg and the capture pipeline, not the preview handle.
+        """
+        if self.rec is not None and self.rec.running:
+            W.warn_box(self, "Recording in progress",
+                       "Stop the recording before running the flicker test.")
             return
-        self.preview_timer.stop()
-        try:
-            res = self.preview.run_flicker_test(2.0)
-        finally:
-            self.preview_timer.start()
+        if not self.cb_device.currentText():
+            W.warn_box(self, "No device", "Pick a DirectShow device first.")
+            return
+        self._flicker_was_previewing = (self.preview is not None
+                                       and self.preview.running)
+        if self._flicker_was_previewing:
+            self._stop_preview()
+        self.lbl_flicker.set("Sampling at the capture frame rate…", "info")
+        self.flicker_job.start(
+            camera.flicker_from_capture, self._spec(),
+            dict(self.ctx.cfg.get("paths", {}) or {}),
+            seconds=float(self.ctx.cfg.get("camera.flicker_seconds", 2.0)),
+            mains_hz=float(self.ctx.cfg.get("camera.mains_hz", 50.0)))
+
+    def _flicker_done(self, res) -> None:
+        if getattr(self, "_flicker_was_previewing", False):
+            self._start_preview()
         self.lbl_flicker.set(
             f"{res.verdict}  [{res.frames} frames at {res.fps:.0f} fps]", res.level)
+        log.info("flicker: %s [%d frames at %.1f fps]",
+                 res.verdict, res.frames, res.fps)
 
     # ------------------------------------------------------------------
     # Recording
