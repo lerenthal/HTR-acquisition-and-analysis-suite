@@ -4,6 +4,13 @@
 .venv/
 .venv-dlc/
 tools/ffmpeg/
+# uv.exe is ~65 MB and bootstrap_tools.ps1 downloads it, so it has no place in
+# source history. The old pattern was "tools/uv*", which does not match
+# "tools/bin/uv.exe" -- gitignore patterns containing no slash match a
+# basename anywhere, but one with a slash is anchored, so "tools/uv*" only
+# ever matched files directly inside tools/. The binary was tracked in all
+# ten commits as a result.
+tools/bin/
 tools/uv*
 __pycache__/
 *.py[cod]
